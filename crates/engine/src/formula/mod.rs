@@ -4,4 +4,4 @@ mod ast;
 mod parser;
 
 pub use ast::{A1, BinaryOp, ErrorKind, Expr, Reference, UnaryOp};
-pub use parser::{ParseError, parse};
+pub use parser::{ParseError, ParseErrorKind, parse};

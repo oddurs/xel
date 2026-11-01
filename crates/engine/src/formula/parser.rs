@@ -1,5 +1,3 @@
-use std::fmt;
-
 use super::ast::{A1, BinaryOp, ErrorKind, Expr, Reference, UnaryOp};
 use crate::CellRef;
 
@@ -10,27 +8,57 @@ const MAX_LEN: usize = 8192;
 const MAX_DEPTH: usize = 256;
 
 /// Why a formula could not be parsed, and where.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{kind} (at character {})", .offset + 1)]
 pub struct ParseError {
     /// Offset in characters from the start of the text passed to [`parse`].
     pub offset: usize,
-    pub message: String,
+    pub kind: ParseErrorKind,
 }
 
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} (at character {})", self.message, self.offset + 1)
-    }
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ParseErrorKind {
+    #[error("formula is longer than {MAX_LEN} characters")]
+    TooLong,
+    #[error("formula is nested too deeply")]
+    TooDeep,
+    #[error("expected a value")]
+    ExpectedValue,
+    #[error("unexpected '{0}'")]
+    Unexpected(char),
+    #[error("expected ')'")]
+    ExpectedCloseParen,
+    #[error("expected ',' or ')'")]
+    ExpectedArgSeparator,
+    #[error("this parenthesis is never closed")]
+    UnclosedParen,
+    #[error("this function call is never closed")]
+    UnclosedCall,
+    #[error("this text is never closed with \"")]
+    UnclosedText,
+    #[error("unknown error value")]
+    UnknownError,
+    #[error("'{0}' is too large")]
+    NumberTooLarge(String),
+    #[error("expected a cell after ':'")]
+    ExpectedCell,
+    #[error("'{0}' is not a valid cell reference")]
+    BadCellReference(String),
+    #[error("this table reference is never closed with ']'")]
+    UnclosedTableReference,
+    #[error("unexpected '[' in a column name")]
+    BracketInColumnName,
+    #[error("unsupported table reference")]
+    UnsupportedTableReference,
 }
-
-impl std::error::Error for ParseError {}
 
 /// Parses formula text in Excel syntax. A leading `=` is optional.
 pub fn parse(text: &str) -> Result<Expr, ParseError> {
     if text.chars().count() > MAX_LEN {
         return Err(ParseError {
             offset: MAX_LEN,
-            message: format!("formula is longer than {MAX_LEN} characters"),
+            kind: ParseErrorKind::TooLong,
         });
     }
     let mut p = Parser {
@@ -44,10 +72,10 @@ pub fn parse(text: &str) -> Result<Expr, ParseError> {
     }
     let expr = p.expr(0)?;
     p.skip_ws();
-    if p.pos < p.src.len() {
-        return Err(p.error_at(p.pos, "unexpected text after the formula"));
+    match p.peek() {
+        None => Ok(expr),
+        Some(c) => Err(p.error_at(p.pos, ParseErrorKind::Unexpected(c))),
     }
-    Ok(expr)
 }
 
 struct Parser<'a> {
@@ -74,6 +102,11 @@ fn infix(op: BinaryOp) -> u8 {
     }
 }
 
+/// Excel separates tokens with ASCII spaces and line breaks only.
+fn is_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
 impl Parser<'_> {
     fn rest(&self) -> &str {
         &self.src[self.pos..]
@@ -90,22 +123,22 @@ impl Parser<'_> {
     }
 
     fn skip_ws(&mut self) {
-        while self.peek().is_some_and(char::is_whitespace) {
+        while self.peek().is_some_and(is_space) {
             self.bump();
         }
     }
 
-    fn error_at(&self, byte: usize, message: impl Into<String>) -> ParseError {
+    fn error_at(&self, byte: usize, kind: ParseErrorKind) -> ParseError {
         ParseError {
             offset: self.src[..byte].chars().count(),
-            message: message.into(),
+            kind,
         }
     }
 
     fn expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
-            return Err(self.error_at(self.pos, "formula is nested too deeply"));
+            return Err(self.error_at(self.pos, ParseErrorKind::TooDeep));
         }
         let mut left = self.prefix()?;
         loop {
@@ -170,7 +203,7 @@ impl Parser<'_> {
         self.skip_ws();
         let start = self.pos;
         let Some(c) = self.peek() else {
-            return Err(self.error_at(start, "expected a value"));
+            return Err(self.error_at(start, ParseErrorKind::ExpectedValue));
         };
         match c {
             '+' | '-' => {
@@ -190,17 +223,21 @@ impl Parser<'_> {
                 self.bump();
                 let inner = self.expr(0)?;
                 self.skip_ws();
-                if self.bump() != Some(')') {
-                    return Err(self.error_at(start, "this parenthesis is never closed"));
+                match self.peek() {
+                    Some(')') => {
+                        self.bump();
+                        Ok(inner)
+                    }
+                    Some(_) => Err(self.error_at(self.pos, ParseErrorKind::ExpectedCloseParen)),
+                    None => Err(self.error_at(start, ParseErrorKind::UnclosedParen)),
                 }
-                Ok(inner)
             }
             '"' => self.string(),
             '#' => self.error_literal(),
             '[' => Ok(Expr::Ref(self.structured(None)?)),
             c if c.is_ascii_digit() || c == '.' => self.number(),
             c if c.is_alphabetic() || c == '_' || c == '$' || c == '\\' => self.word(),
-            _ => Err(self.error_at(start, format!("unexpected '{c}'"))),
+            _ => Err(self.error_at(start, ParseErrorKind::Unexpected(c))),
         }
     }
 
@@ -220,7 +257,7 @@ impl Parser<'_> {
             frac = digits(self);
         }
         if !int && !frac {
-            return Err(self.error_at(start, "expected a number"));
+            return Err(self.error_at(start, ParseErrorKind::Unexpected('.')));
         }
         if matches!(self.peek(), Some('e' | 'E')) {
             let mark = self.pos;
@@ -234,11 +271,10 @@ impl Parser<'_> {
             }
         }
         let text = &self.src[start..self.pos];
-        let value: f64 = text
-            .parse()
-            .map_err(|_| self.error_at(start, format!("'{text}' is not a number")))?;
+        // The scan above admits only shapes `f64::from_str` accepts.
+        let value: f64 = text.parse().expect("scanned digits form a valid float");
         if !value.is_finite() {
-            return Err(self.error_at(start, format!("'{text}' is too large")));
+            return Err(self.error_at(start, ParseErrorKind::NumberTooLarge(text.into())));
         }
         Ok(Expr::Number(value))
     }
@@ -255,7 +291,7 @@ impl Parser<'_> {
                 }
                 Some('"') => return Ok(Expr::Text(out)),
                 Some(c) => out.push(c),
-                None => return Err(self.error_at(start, "this text is never closed with \"")),
+                None => return Err(self.error_at(start, ParseErrorKind::UnclosedText)),
             }
         }
     }
@@ -273,7 +309,7 @@ impl Parser<'_> {
                 return Ok(Expr::Error(kind));
             }
         }
-        Err(self.error_at(start, "unknown error value"))
+        Err(self.error_at(start, ParseErrorKind::UnknownError))
     }
 
     /// A function name, boolean, cell or range, table reference, or defined name.
@@ -286,8 +322,13 @@ impl Parser<'_> {
             self.bump();
         }
         let word = &self.src[start..self.pos];
+        let bad_cell = || ParseErrorKind::BadCellReference(word.into());
 
         match self.peek() {
+            // Function names may look like cells (LOG10, ATAN2, DAYS360), but never hold `$`.
+            Some('(' | '[') if word.contains('$') => {
+                return Err(self.error_at(start, bad_cell()));
+            }
             Some('(') => {
                 self.bump();
                 let args = self.args(start)?;
@@ -317,13 +358,14 @@ impl Parser<'_> {
                     self.bump();
                 }
                 let b = parse_a1(&self.src[from..self.pos])
-                    .ok_or_else(|| self.error_at(colon, "expected a cell after ':'"))?;
+                    .ok_or_else(|| self.error_at(colon, ParseErrorKind::ExpectedCell))?;
+                let (a, b) = normalize(a, b);
                 return Ok(Expr::Ref(Reference::Range(a, b)));
             }
             return Ok(Expr::Ref(Reference::Cell(a)));
         }
         if word.contains('$') {
-            return Err(self.error_at(start, format!("'{word}' is not a valid cell reference")));
+            return Err(self.error_at(start, bad_cell()));
         }
         Ok(Expr::Name(word.to_string()))
     }
@@ -343,10 +385,18 @@ impl Parser<'_> {
                 args.push(self.expr(0)?);
             }
             self.skip_ws();
-            match self.bump() {
-                Some(',') => {}
-                Some(')') => return Ok(args),
-                _ => return Err(self.error_at(call_start, "this function call is never closed")),
+            match self.peek() {
+                Some(',') => {
+                    self.bump();
+                }
+                Some(')') => {
+                    self.bump();
+                    return Ok(args);
+                }
+                Some(_) => {
+                    return Err(self.error_at(self.pos, ParseErrorKind::ExpectedArgSeparator));
+                }
+                None => return Err(self.error_at(call_start, ParseErrorKind::UnclosedCall)),
             }
         }
     }
@@ -360,18 +410,21 @@ impl Parser<'_> {
         if this_row {
             self.bump();
         }
-        let column = if self.peek() == Some('[') {
+        let nested = self.peek() == Some('[');
+        if nested {
             self.bump();
-            let name = self.bracketed(start)?;
-            if self.bump() != Some(']') {
-                return Err(self.error_at(start, "expected ']' to close the table reference"));
-            }
-            name
-        } else {
-            self.bracketed(start)?
-        };
-        if column.is_empty() || column.starts_with('#') {
-            return Err(self.error_at(start, "unsupported table reference"));
+        }
+        // Special items such as `[#This Row]` start with an unescaped `#`; `'#` is a
+        // literal `#` in a column name.
+        if self.peek() == Some('#') {
+            return Err(self.error_at(start, ParseErrorKind::UnsupportedTableReference));
+        }
+        let column = self.bracketed(start)?;
+        if nested && self.bump() != Some(']') {
+            return Err(self.error_at(start, ParseErrorKind::UnclosedTableReference));
+        }
+        if column.is_empty() {
+            return Err(self.error_at(start, ParseErrorKind::UnsupportedTableReference));
         }
         Ok(Reference::Structured {
             table,
@@ -387,7 +440,9 @@ impl Parser<'_> {
         loop {
             match self.bump() {
                 Some(']') => return Ok(out),
-                Some('[') => return Err(self.error_at(start, "unexpected '[' in a column name")),
+                Some('[') => {
+                    return Err(self.error_at(start, ParseErrorKind::BracketInColumnName));
+                }
                 Some('\'') => match self.bump() {
                     Some(c) => out.push(c),
                     None => break,
@@ -396,32 +451,24 @@ impl Parser<'_> {
                 None => break,
             }
         }
-        Err(self.error_at(start, "this table reference is never closed with ']'"))
+        Err(self.error_at(start, ParseErrorKind::UnclosedTableReference))
     }
 }
 
-/// `B12`, `$B12`, `B$12`, `$B$12`, within Excel's grid.
+/// `B12`, `$B12`, `B$12`, `$B$12`, `B012`, within Excel's grid.
 fn parse_a1(word: &str) -> Option<A1> {
-    let bytes = word.as_bytes();
-    let mut i = 0;
-    let col_absolute = bytes.first() == Some(&b'$');
-    if col_absolute {
-        i += 1;
-    }
-    let letters_start = i;
-    while bytes.get(i).is_some_and(u8::is_ascii_alphabetic) {
-        i += 1;
-    }
-    let letters = &word[letters_start..i];
-    let row_absolute = bytes.get(i) == Some(&b'$');
-    if row_absolute {
-        i += 1;
-    }
-    let digits = &word[i..];
-    if letters.is_empty() || letters.len() > 3 || digits.is_empty() {
+    let col_absolute = word.starts_with('$');
+    let rest = if col_absolute { &word[1..] } else { word };
+    let letters_end = rest
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(rest.len());
+    let (letters, rest) = rest.split_at(letters_end);
+    let row_absolute = rest.starts_with('$');
+    let digits = if row_absolute { &rest[1..] } else { rest };
+    if letters.len() > 3 {
         return None;
     }
-    let cell: CellRef = format!("{letters}{digits}").parse().ok()?;
+    let cell = CellRef::from_parts(letters, digits).ok()?;
     Some(A1 {
         row: cell.row,
         col: cell.col,
@@ -430,9 +477,31 @@ fn parse_a1(word: &str) -> Option<A1> {
     })
 }
 
+/// Orders a range's corners top-left to bottom-right, as Excel does on entry
+/// (`B2:A1` becomes `A1:B2`). Each `$` stays with the row or column it anchors.
+fn normalize(a: A1, b: A1) -> (A1, A1) {
+    let (top, bottom) = if a.row <= b.row { (a, b) } else { (b, a) };
+    let (left, right) = if a.col <= b.col { (a, b) } else { (b, a) };
+    (
+        A1 {
+            row: top.row,
+            row_absolute: top.row_absolute,
+            col: left.col,
+            col_absolute: left.col_absolute,
+        },
+        A1 {
+            row: bottom.row,
+            row_absolute: bottom.row_absolute,
+            col: right.col,
+            col_absolute: right.col_absolute,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ParseErrorKind as K;
 
     fn p(s: &str) -> Expr {
         parse(s).unwrap_or_else(|e| panic!("{s}: {e}"))
@@ -463,6 +532,15 @@ mod tests {
             column: name.into(),
             this_row,
         })
+    }
+
+    fn a1(row: u32, col: u32, row_absolute: bool, col_absolute: bool) -> A1 {
+        A1 {
+            row,
+            col,
+            row_absolute,
+            col_absolute,
+        }
     }
 
     #[test]
@@ -499,6 +577,15 @@ mod tests {
             un(UnaryOp::Percent, un(UnaryOp::Minus, num(50.0))),
             "negation binds tighter than % in Excel"
         );
+        assert_eq!(p("1--1"), bin(Sub, num(1.0), un(UnaryOp::Minus, num(1.0))));
+        assert_eq!(
+            p("2*-3^2"),
+            bin(
+                Mul,
+                num(2.0),
+                bin(Pow, un(UnaryOp::Minus, num(3.0)), num(2.0))
+            )
+        );
         assert_eq!(p("1<>2"), bin(Ne, num(1.0), num(2.0)));
         assert_eq!(p("1<=2"), bin(Le, num(1.0), num(2.0)));
     }
@@ -516,12 +603,6 @@ mod tests {
 
     #[test]
     fn references() {
-        let a1 = |row, col, ra, ca| A1 {
-            row,
-            col,
-            row_absolute: ra,
-            col_absolute: ca,
-        };
         assert_eq!(
             p("B12"),
             Expr::Ref(Reference::Cell(a1(11, 1, false, false)))
@@ -535,6 +616,15 @@ mod tests {
             Expr::Ref(Reference::Cell(a1(11, 1, true, false)))
         );
         assert_eq!(
+            p("A01"),
+            p("A1"),
+            "leading zeros are accepted, as Excel does"
+        );
+        assert_eq!(
+            p("$B$007"),
+            Expr::Ref(Reference::Cell(a1(6, 1, true, true)))
+        );
+        assert_eq!(
             p("A1:$C$3"),
             Expr::Ref(Reference::Range(
                 a1(0, 0, false, false),
@@ -545,6 +635,11 @@ mod tests {
         assert_eq!(p("[@[Unit Price]]"), col("Unit Price", true));
         assert_eq!(p("[Amount]"), col("Amount", false));
         assert_eq!(p("[Q1'[est']]"), col("Q1[est]", false));
+        assert_eq!(
+            p("['#Items]"),
+            col("#Items", false),
+            "an escaped # is a literal"
+        );
         assert_eq!(
             p("Orders[Amount]"),
             Expr::Ref(Reference::Structured {
@@ -558,6 +653,26 @@ mod tests {
             p("XFE1"),
             Expr::Name("XFE1".into()),
             "beyond the grid is a name"
+        );
+    }
+
+    #[test]
+    fn reversed_ranges_are_normalized() {
+        assert_eq!(p("B2:A1"), p("A1:B2"));
+        assert_eq!(
+            p("B$2:$A1"),
+            Expr::Ref(Reference::Range(
+                a1(0, 0, false, true),
+                a1(1, 1, true, false)
+            )),
+            "each $ stays with the row or column it anchors"
+        );
+        assert_eq!(
+            p("A2:B1"),
+            Expr::Ref(Reference::Range(
+                a1(0, 0, false, false),
+                a1(1, 1, false, false)
+            ))
         );
     }
 
@@ -581,7 +696,7 @@ mod tests {
             p("IF(A1,,1)"),
             Expr::Call {
                 name: "IF".into(),
-                args: vec![p("A1"), Expr::Missing, num(1.0)],
+                args: vec![p("A1"), Expr::Missing, num(1.0)]
             }
         );
         assert_eq!(
@@ -593,6 +708,13 @@ mod tests {
             "a function whose name looks like a cell"
         );
         assert_eq!(
+            p("STDEV.S(1)"),
+            Expr::Call {
+                name: "STDEV.S".into(),
+                args: vec![num(1.0)]
+            }
+        );
+        assert_eq!(
             p("=[@Qty] * [@Price]"),
             bin(BinaryOp::Mul, col("Qty", true), col("Price", true))
         );
@@ -600,42 +722,43 @@ mod tests {
 
     #[test]
     fn errors_point_at_the_problem() {
+        let bad_cell = |s: &str| K::BadCellReference(s.into());
         let cases = [
-            ("=1+", 3, "expected a value"),
-            ("=(1+2", 1, "never closed"),
-            ("=\"abc", 1, "never closed"),
-            ("=SUM(1,2", 1, "never closed"),
-            ("=1 2", 3, "unexpected text"),
-            ("=#WAT", 1, "unknown error"),
-            ("=[@Amount", 1, "never closed"),
-            ("=A1:", 3, "expected a cell"),
-            ("=$foo", 1, "not a valid cell"),
-            ("=ü+?", 3, "unexpected '?'"),
+            ("=1+", 3, K::ExpectedValue),
+            ("=(1+2", 1, K::UnclosedParen),
+            ("=(1 2)", 4, K::ExpectedCloseParen),
+            ("=\"abc", 1, K::UnclosedText),
+            ("=SUM(1,2", 1, K::UnclosedCall),
+            ("=SUM(1 2)", 7, K::ExpectedArgSeparator),
+            ("=1 2", 3, K::Unexpected('2')),
+            ("=#WAT", 1, K::UnknownError),
+            ("=[@Amount", 1, K::UnclosedTableReference),
+            ("=[#This Row]", 1, K::UnsupportedTableReference),
+            ("=A1:", 3, K::ExpectedCell),
+            ("=$foo", 1, bad_cell("$foo")),
+            ("=$SUM(1)", 1, bad_cell("$SUM")),
+            ("=$A[x]", 1, bad_cell("$A")),
+            ("=ü+?", 3, K::Unexpected('?')),
+            ("=\u{a0}1", 1, K::Unexpected('\u{a0}')),
         ];
-        for (text, offset, needle) in cases {
+        for (text, offset, kind) in cases {
             let e = parse(text).expect_err(text);
-            assert_eq!(e.offset, offset, "{text}: {e}");
-            assert!(e.message.contains(needle), "{text}: {e}");
+            assert_eq!((e.offset, &e.kind), (offset, &kind), "{text}: {e}");
         }
     }
 
     #[test]
     fn deep_nesting_is_an_error_not_a_crash() {
         let deep = format!("={}1{}", "(".repeat(3000), ")".repeat(3000));
-        assert!(
-            parse(&deep)
-                .unwrap_err()
-                .message
-                .contains("nested too deeply")
-        );
+        assert_eq!(parse(&deep).unwrap_err().kind, K::TooDeep);
         let minus = format!("={}1", "-".repeat(3000));
-        assert!(parse(&minus).is_err());
+        assert_eq!(parse(&minus).unwrap_err().kind, K::TooDeep);
     }
 
     #[test]
     fn overlong_formulas_are_refused() {
         let long = format!("={}", "1+".repeat(5000) + "1");
-        assert!(parse(&long).unwrap_err().message.contains("longer than"));
+        assert_eq!(parse(&long).unwrap_err().kind, K::TooLong);
     }
 
     /// Formulas of the shapes found in real workbooks. Each must parse; the function
@@ -668,12 +791,16 @@ mod tests {
         for text in corpus {
             parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
         }
-        // Not yet supported; each must fail cleanly. Whole-column ranges and sheet
-        // references arrive with calc blocks. A space before `(` is Excel's intersection
-        // operator, which Excel also rejects here.
+        // Not yet supported; each must fail cleanly until its follow-up item lands. A
+        // space before `(` is Excel's intersection operator, which Excel also rejects.
         for text in [
             "=COUNTIFS(A:A,\"x\")",
             "=IFERROR(VLOOKUP($A2,Sheet2!$A$1:$C$100,3,FALSE),\"\")",
+            "=SUM({1,2;3,4})",
+            "=@A1:A10",
+            "=SUM(A1#)",
+            "=Orders[[#This Row],[Amount]]",
+            "=#SPILL!",
             "=  SUM ( 1 , 2 )",
         ] {
             assert!(
@@ -691,7 +818,8 @@ mod tests {
         const ALPHABET: &[&str] = &[
             "=", "+", "-", "*", "/", "^", "&", "%", "<", ">", "<>", "<=", "(", ")", ",", ":", "\"",
             "[", "]", "@", "'", "#", "$", "!", "?", ".", "e", " ", "1", "9", "A", "Z", "SUM", "IF",
-            "TRUE", "#N/A", "#DIV/0!", "A1", "$B$2", "Orders", "ü", "😀",
+            "TRUE", "#N/A", "#DIV/0!", "A1", "$B$2", "Orders", "ü", "😀", "\u{a0}", "['", "[[",
+            "{", ";", "0",
         ];
         let seconds: Option<u64> = std::env::var("XEL_FUZZ_SECONDS")
             .ok()
@@ -722,7 +850,12 @@ mod tests {
             let text: String = (0..len)
                 .map(|_| ALPHABET[usize::try_from(next() % ALPHABET.len() as u64).unwrap()])
                 .collect();
-            let _ = parse(&text);
+            if let Err(e) = parse(&text) {
+                assert!(
+                    e.offset <= text.chars().count(),
+                    "{text:?}: offset past the end"
+                );
+            }
             runs += 1;
             let done = match deadline {
                 Some(d) => runs.is_multiple_of(10_000) && std::time::Instant::now() >= d,
