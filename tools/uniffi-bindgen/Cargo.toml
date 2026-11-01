@@ -1,0 +1,14 @@
+[package]
+name = "uniffi-bindgen"
+version = "0.1.0"
+description = "Generates the Swift bindings for xel-ffi"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Its own workspace, so the generator's `cli` features are not merged into the engine's
+# static library by a workspace-wide build.
+[workspace]
+
+[dependencies]
+uniffi = { version = "0.32.2", features = ["cli"] }

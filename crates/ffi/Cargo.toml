@@ -1,0 +1,25 @@
+[package]
+name = "xel-ffi"
+version = "0.1.0"
+description = "The xel engine as a C ABI with generated Swift bindings"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+thiserror = "2.0.21"
+uniffi = "0.32.2"
+xel-engine = { path = "../engine" }
+
+# The workspace forbids unsafe code; UniFFI's generated scaffolding needs it, and this
+# crate is the one place that may (see .claude/rules/rust.md).
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

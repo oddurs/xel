@@ -13,3 +13,7 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+# The FFI relies on unwinding: UniFFI catches a Rust panic and throws it in Swift.
+panic = "unwind"

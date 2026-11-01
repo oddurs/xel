@@ -47,7 +47,7 @@ scripts/task check      all of the above; what CI and pre-push run
 ## Commits and pull requests
 
 - Conventional Commits: `type(scope)!: subject`, imperative, at most 72 characters, no
-  trailing period. The body explains why. Scopes: `engine`, `app`, `ci`, `docs`.
+  trailing period. The body explains why. Scopes: `engine`, `bridge`, `app`, `ci`, `docs`.
 - The PR description fills in the template: the problem, the approach, and where the
   change is weakest.
 
