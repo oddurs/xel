@@ -4,7 +4,9 @@
 
 use std::fmt;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::history::{Change, ColumnSpec, TableSpec, next_id};
 
 use crate::error::{Error, Result};
 use crate::workbook::Workbook;
@@ -12,12 +14,12 @@ use crate::workbook::Workbook;
 /// Metadata tables, created with every new workbook.
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE xel_tables (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
     position INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE xel_columns (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     table_id INTEGER NOT NULL REFERENCES xel_tables (id) ON DELETE CASCADE,
     name TEXT NOT NULL COLLATE NOCASE,
     type TEXT NOT NULL CHECK (type IN ('text', 'number', 'checkbox', 'date', 'select')),
@@ -66,7 +68,7 @@ pub enum ColumnType {
 }
 
 impl ColumnType {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Text => "text",
             Self::Number => "number",
@@ -76,7 +78,7 @@ impl ColumnType {
         }
     }
 
-    fn parse(s: &str) -> Result<Self> {
+    pub(crate) fn parse(s: &str) -> Result<Self> {
         Ok(match s {
             "text" => Self::Text,
             "number" => Self::Number,
@@ -89,7 +91,7 @@ impl ColumnType {
 
     /// The column definition in the user table. STRICT tables enforce the storage
     /// class; the CHECKs keep external writers to the values xel can show.
-    fn sql(self, quoted: &str) -> String {
+    pub(crate) fn sql(self, quoted: &str) -> String {
         match self {
             Self::Text | Self::Select => format!("{quoted} TEXT"),
             Self::Number => format!("{quoted} REAL"),
@@ -155,140 +157,144 @@ impl Workbook {
                 return Err(Error::DuplicateName((*col).into()));
             }
         }
-        let tx = self.write()?;
-        ensure_table_name_free(&tx, name)?;
-        let defs: Vec<String> = columns.iter().map(|(c, ty)| ty.sql(&quote(c))).collect();
-        tx.execute_batch(&format!(
-            // AUTOINCREMENT: a deleted row's id is never handed out again, so an id held
-            // by undo, a selection, or a script cannot silently point at another row.
-            "CREATE TABLE {} ({} INTEGER PRIMARY KEY AUTOINCREMENT, {}) STRICT;",
-            quote(name),
-            quote(ROW_ID),
-            defs.join(", ")
-        ))?;
-        tx.execute(
-            "INSERT INTO xel_tables (name, position) \
-             VALUES (?1, (SELECT coalesce(max(position), -1) + 1 FROM xel_tables))",
-            [name],
-        )?;
-        let table = tx.last_insert_rowid();
-        for (pos, (col, ty)) in (0_i64..).zip(columns) {
-            tx.execute(
-                "INSERT INTO xel_columns (table_id, name, type, position) VALUES (?1, ?2, ?3, ?4)",
-                params![table, col, ty.as_str(), pos],
+        self.edit(|tx| {
+            ensure_table_name_free(tx, name)?;
+            let id = TableId(next_id(tx, "xel_tables")?);
+            let first_column = next_id(tx, "xel_columns")?;
+            let position: i64 = tx.query_row(
+                "SELECT coalesce(max(position), -1) + 1 FROM xel_tables",
+                [],
+                |r| r.get(0),
             )?;
-        }
-        tx.commit()?;
-        Ok(TableId(table))
+            let columns = (0_i64..)
+                .zip(columns)
+                .map(|(i, (col, ty))| ColumnSpec {
+                    id: ColumnId(first_column + i),
+                    name: (*col).into(),
+                    ty: *ty,
+                    position: i,
+                    options: Vec::new(),
+                })
+                .collect();
+            let spec = TableSpec {
+                id,
+                name: name.into(),
+                position,
+                columns,
+            };
+            Ok((
+                vec![Change::CreateTable {
+                    spec,
+                    from_trash: false,
+                }],
+                id,
+            ))
+        })
     }
 
     pub fn rename_table(&mut self, id: TableId, new_name: &str) -> Result<()> {
         check_table_name(new_name)?;
-        let tx = self.write()?;
-        let old = table_name(&tx, id)?;
-        if old == new_name {
-            return Ok(());
-        }
-        if old.eq_ignore_ascii_case(new_name) {
-            // SQLite sees a case-only change as renaming onto an existing table, so step
-            // through a name no user table can have.
-            let step = quote(&format!("xel_rename_{}", id.0));
-            tx.execute_batch(&format!("ALTER TABLE {} RENAME TO {step};", quote(&old)))?;
-            tx.execute_batch(&format!(
-                "ALTER TABLE {step} RENAME TO {};",
-                quote(new_name)
-            ))?;
-        } else {
-            ensure_table_name_free(&tx, new_name)?;
-            tx.execute_batch(&format!(
-                "ALTER TABLE {} RENAME TO {};",
-                quote(&old),
-                quote(new_name)
-            ))?;
-        }
-        tx.execute(
-            "UPDATE xel_tables SET name = ?1 WHERE id = ?2",
-            params![new_name, id.0],
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.edit(|tx| {
+            let old = table_name(tx, id)?;
+            if old == new_name {
+                return Ok((vec![], ()));
+            }
+            if !old.eq_ignore_ascii_case(new_name) {
+                ensure_table_name_free(tx, new_name)?;
+            }
+            Ok((
+                vec![Change::RenameTable {
+                    id,
+                    from: old,
+                    to: new_name.into(),
+                }],
+                (),
+            ))
+        })
     }
 
+    /// Deletes a table. Undo brings it back with its rows.
     pub fn delete_table(&mut self, id: TableId) -> Result<()> {
-        let tx = self.write()?;
-        let name = table_name(&tx, id)?;
-        tx.execute_batch(&format!("DROP TABLE {};", quote(&name)))?;
-        tx.execute("DELETE FROM xel_tables WHERE id = ?1", [id.0])?;
-        tx.commit()?;
-        Ok(())
+        self.edit(|tx| {
+            Ok((
+                vec![Change::DeleteTable {
+                    spec: table_spec(tx, id)?,
+                }],
+                (),
+            ))
+        })
     }
 
     /// Adds a column at the end of the table.
     pub fn add_column(&mut self, table: TableId, name: &str, ty: ColumnType) -> Result<ColumnId> {
         check_column_name(name)?;
-        let tx = self.write()?;
-        let tname = table_name(&tx, table)?;
-        ensure_column_name_free(&tx, table, name, None)?;
-        tx.execute_batch(&format!(
-            "ALTER TABLE {} ADD COLUMN {};",
-            quote(&tname),
-            ty.sql(&quote(name))
-        ))?;
-        tx.execute(
-            "INSERT INTO xel_columns (table_id, name, type, position) VALUES (?1, ?2, ?3, \
-             (SELECT coalesce(max(position), -1) + 1 FROM xel_columns WHERE table_id = ?1))",
-            params![table.0, name, ty.as_str()],
-        )?;
-        let id = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(ColumnId(id))
+        self.edit(|tx| {
+            table_name(tx, table)?;
+            ensure_column_name_free(tx, table, name, None)?;
+            let id = ColumnId(next_id(tx, "xel_columns")?);
+            let position: i64 = tx.query_row(
+                "SELECT coalesce(max(position), -1) + 1 FROM xel_columns WHERE table_id = ?1",
+                [table.0],
+                |r| r.get(0),
+            )?;
+            let spec = ColumnSpec {
+                id,
+                name: name.into(),
+                ty,
+                position,
+                options: Vec::new(),
+            };
+            Ok((
+                vec![Change::AddColumn {
+                    table,
+                    spec,
+                    from_trash: false,
+                }],
+                id,
+            ))
+        })
     }
 
     pub fn rename_column(&mut self, id: ColumnId, new_name: &str) -> Result<()> {
         check_column_name(new_name)?;
-        let tx = self.write()?;
-        let info = column_info(&tx, id)?;
-        if info.name == new_name {
-            return Ok(());
-        }
-        ensure_column_name_free(&tx, info.table, new_name, Some(id))?;
-        let tname = table_name(&tx, info.table)?;
-        tx.execute_batch(&format!(
-            "ALTER TABLE {} RENAME COLUMN {} TO {};",
-            quote(&tname),
-            quote(&info.name),
-            quote(new_name)
-        ))?;
-        tx.execute(
-            "UPDATE xel_columns SET name = ?1 WHERE id = ?2",
-            params![new_name, id.0],
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.edit(|tx| {
+            let info = column_info(tx, id)?;
+            if info.name == new_name {
+                return Ok((vec![], ()));
+            }
+            ensure_column_name_free(tx, info.table, new_name, Some(id))?;
+            let change = Change::RenameColumn {
+                table: info.table,
+                id,
+                from: info.name,
+                to: new_name.into(),
+            };
+            Ok((vec![change], ()))
+        })
     }
 
-    /// Deletes a column and its data. A table's last column cannot be deleted; delete the
-    /// table instead.
+    /// Deletes a column and its data; undo brings both back. A table's last column cannot
+    /// be deleted; delete the table instead.
     pub fn delete_column(&mut self, id: ColumnId) -> Result<()> {
-        let tx = self.write()?;
-        let info = column_info(&tx, id)?;
-        let count: i64 = tx.query_row(
-            "SELECT count(*) FROM xel_columns WHERE table_id = ?1",
-            [info.table.0],
-            |r| r.get(0),
-        )?;
-        if count == 1 {
-            return Err(Error::LastColumn(id));
-        }
-        let tname = table_name(&tx, info.table)?;
-        tx.execute_batch(&format!(
-            "ALTER TABLE {} DROP COLUMN {};",
-            quote(&tname),
-            quote(&info.name)
-        ))?;
-        tx.execute("DELETE FROM xel_columns WHERE id = ?1", [id.0])?;
-        tx.commit()?;
-        Ok(())
+        self.edit(|tx| {
+            let info = column_info(tx, id)?;
+            let count: i64 = tx.query_row(
+                "SELECT count(*) FROM xel_columns WHERE table_id = ?1",
+                [info.table.0],
+                |r| r.get(0),
+            )?;
+            if count == 1 {
+                return Err(Error::LastColumn(id));
+            }
+            let spec = column_spec(tx, id)?;
+            Ok((
+                vec![Change::DeleteColumn {
+                    table: info.table,
+                    spec,
+                }],
+                (),
+            ))
+        })
     }
 
     /// Replaces a select column's options. Values already stored are not changed.
@@ -299,31 +305,74 @@ impl Workbook {
                 return Err(Error::DuplicateName((*option).into()));
             }
         }
-        let tx = self.write()?;
-        if column_info(&tx, id)?.ty != ColumnType::Select {
-            return Err(Error::NotASelectColumn(id));
-        }
-        tx.execute(
-            "DELETE FROM xel_select_options WHERE column_id = ?1",
-            [id.0],
-        )?;
-        for (pos, value) in (0_i64..).zip(options) {
-            tx.execute(
-                "INSERT INTO xel_select_options (column_id, position, value) VALUES (?1, ?2, ?3)",
-                params![id.0, pos, value],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.edit(|tx| {
+            if column_info(tx, id)?.ty != ColumnType::Select {
+                return Err(Error::NotASelectColumn(id));
+            }
+            let from = column_spec(tx, id)?.options;
+            let to: Vec<String> = options.iter().map(|o| (*o).to_string()).collect();
+            if from == to {
+                return Ok((vec![], ()));
+            }
+            Ok((
+                vec![Change::SetOptions {
+                    column: id,
+                    from,
+                    to,
+                }],
+                (),
+            ))
+        })
     }
+}
 
-    /// Starts a write transaction. IMMEDIATE takes the write lock up front, so a schema
-    /// change that reads before it writes cannot fail half-way on a lock upgrade.
-    pub(crate) fn write(&mut self) -> Result<Transaction<'_>> {
-        Ok(self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?)
-    }
+/// Everything needed to recreate a table exactly.
+fn table_spec(conn: &Connection, id: TableId) -> Result<TableSpec> {
+    let (name, position): (String, i64) = conn
+        .query_row(
+            "SELECT name, position FROM xel_tables WHERE id = ?1",
+            [id.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or(Error::NoSuchTable(id))?;
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM xel_columns WHERE table_id = ?1 ORDER BY position, id")?
+        .query_map([id.0], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let columns = ids
+        .into_iter()
+        .map(|c| column_spec(conn, ColumnId(c)))
+        .collect::<Result<_>>()?;
+    Ok(TableSpec {
+        id,
+        name,
+        position,
+        columns,
+    })
+}
+
+/// Everything needed to recreate a column exactly.
+fn column_spec(conn: &Connection, id: ColumnId) -> Result<ColumnSpec> {
+    let (name, ty, position): (String, String, i64) = conn
+        .query_row(
+            "SELECT name, type, position FROM xel_columns WHERE id = ?1",
+            [id.0],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(Error::NoSuchColumn(id))?;
+    let options = conn
+        .prepare("SELECT value FROM xel_select_options WHERE column_id = ?1 ORDER BY position")?
+        .query_map([id.0], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ColumnSpec {
+        id,
+        name,
+        ty: ColumnType::parse(&ty)?,
+        position,
+        options,
+    })
 }
 
 /// Loads every table, or just `only`, with columns and options in one query.
@@ -423,7 +472,7 @@ fn check_table_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn table_name(conn: &Connection, id: TableId) -> Result<String> {
+pub(crate) fn table_name(conn: &Connection, id: TableId) -> Result<String> {
     conn.query_row("SELECT name FROM xel_tables WHERE id = ?1", [id.0], |r| {
         r.get(0)
     })

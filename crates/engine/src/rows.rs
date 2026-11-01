@@ -4,7 +4,9 @@
 use std::collections::BTreeSet;
 
 use rusqlite::types::{Value as SqlValue, ValueRef};
-use rusqlite::{ErrorCode, params_from_iter};
+use rusqlite::{ErrorCode, OptionalExtension};
+
+use crate::history::{CellChange, Change, StoredRow, next_id};
 
 use crate::cell::{CellValue, Date};
 use crate::error::{Error, Result};
@@ -92,33 +94,30 @@ impl Workbook {
         values: &[(ColumnId, CellValue)],
     ) -> Result<RowId> {
         let t = self.table(table)?;
-        let mut names = Vec::with_capacity(values.len());
-        let mut params = Vec::with_capacity(values.len());
+        let mut stored_values = Vec::with_capacity(values.len());
         let mut seen = BTreeSet::new();
         for (id, value) in values {
             let col = column_of(&t, *id)?;
             if !seen.insert(*id) {
                 return Err(Error::DuplicateName(col.name.clone()));
             }
-            params.push(stored(col, value)?);
-            names.push(quote(&col.name));
+            stored_values.push((*id, stored(col, value)?));
         }
-        let sql = if names.is_empty() {
-            format!("INSERT INTO {} DEFAULT VALUES", quote(&t.name))
-        } else {
-            let marks = vec!["?"; names.len()].join(", ");
-            format!(
-                "INSERT INTO {} ({}) VALUES ({marks})",
-                quote(&t.name),
-                names.join(", ")
-            )
-        };
-        let tx = self.write()?;
-        tx.execute(&sql, params_from_iter(params))
-            .map_err(|e| out_of_sync(&t, e))?;
-        let id = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(RowId { table, id })
+        self.edit(|tx| {
+            let id = next_id(tx, &t.name)?;
+            let row = StoredRow {
+                id,
+                values: stored_values,
+            };
+            Ok((
+                vec![Change::InsertRows {
+                    table,
+                    rows: vec![row],
+                }],
+                RowId { table, id },
+            ))
+        })
+        .map_err(|e| corrupt_if_out_of_sync(&t, e))
     }
 
     /// Sets one cell. The value must fit the column's type.
@@ -126,8 +125,8 @@ impl Workbook {
         self.set_cells(row.table, &[(column, row, value.clone())])
     }
 
-    /// Sets many cells of one table in one transaction, as a paste does. Every value is
-    /// checked before anything is written; any failure writes nothing.
+    /// Sets many cells of one table as one edit, as a paste does. Every value is checked
+    /// before anything is written; any failure writes nothing.
     pub fn set_cells(
         &mut self,
         table: TableId,
@@ -135,55 +134,111 @@ impl Workbook {
     ) -> Result<()> {
         let t = self.table(table)?;
         let mut writes = Vec::with_capacity(cells.len());
+        let mut index = std::collections::HashMap::new();
         for (column, row, value) in cells {
             let col = column_of(&t, *column)?;
             if row.table != table {
                 return Err(Error::NoSuchRow(*row));
             }
-            writes.push((quote(&col.name), row.id, stored(col, value)?));
-        }
-        let tx = self.write()?;
-        for (col, id, value) in writes {
-            let sql = format!(
-                "UPDATE {} SET {col} = ?1 WHERE {} = ?2",
-                quote(&t.name),
-                quote(ROW_ID)
-            );
-            let mut stmt = tx.prepare_cached(&sql).map_err(|e| out_of_sync(&t, e))?;
-            if stmt
-                .execute(rusqlite::params![value, id])
-                .map_err(|e| out_of_sync(&t, e))?
-                == 0
-            {
-                return Err(Error::NoSuchRow(RowId { table, id }));
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Deletes rows. Naming a row twice is fine; naming a missing row deletes nothing.
-    pub fn delete_rows(&mut self, table: TableId, rows: &[RowId]) -> Result<()> {
-        let t = self.table(table)?;
-        let unique: BTreeSet<RowId> = rows.iter().copied().collect();
-        let tx = self.write()?;
-        {
-            let sql = format!(
-                "DELETE FROM {} WHERE {} = ?1",
-                quote(&t.name),
-                quote(ROW_ID)
-            );
-            let mut stmt = tx.prepare(&sql).map_err(|e| out_of_sync(&t, e))?;
-            for row in unique {
-                if row.table != table
-                    || stmt.execute([row.id]).map_err(|e| out_of_sync(&t, e))? == 0
-                {
-                    return Err(Error::NoSuchRow(row));
+            // The last write to a cell wins, as if the writes were applied in order.
+            let write = (col, row.id, stored(col, value)?);
+            match index.entry((col.id, row.id)) {
+                std::collections::hash_map::Entry::Occupied(at) => writes[*at.get()] = write,
+                std::collections::hash_map::Entry::Vacant(at) => {
+                    at.insert(writes.len());
+                    writes.push(write);
                 }
             }
         }
-        tx.commit()?;
-        Ok(())
+        self.edit(|tx| {
+            let mut changes = Vec::with_capacity(writes.len());
+            for (col, id, to) in writes {
+                let sql = format!(
+                    "SELECT {} FROM {} WHERE {} = ?1",
+                    quote(&col.name),
+                    quote(&t.name),
+                    quote(ROW_ID)
+                );
+                let from: SqlValue = tx
+                    .prepare_cached(&sql)?
+                    .query_row([id], |r| r.get(0))
+                    .optional()?
+                    .ok_or(Error::NoSuchRow(RowId { table, id }))?;
+                // Re-entering the value a cell already has is not an edit to undo.
+                if from != to {
+                    changes.push(CellChange {
+                        column: col.id,
+                        row: id,
+                        from,
+                        to,
+                    });
+                }
+            }
+            if changes.is_empty() {
+                return Ok((vec![], ()));
+            }
+            Ok((
+                vec![Change::SetCells {
+                    table,
+                    cells: changes,
+                }],
+                (),
+            ))
+        })
+        .map_err(|e| corrupt_if_out_of_sync(&t, e))
+    }
+
+    /// Deletes rows; undo brings them back with the same ids. Naming a row twice is fine;
+    /// naming a missing row deletes nothing.
+    pub fn delete_rows(&mut self, table: TableId, rows: &[RowId]) -> Result<()> {
+        let t = self.table(table)?;
+        let unique: BTreeSet<RowId> = rows.iter().copied().collect();
+        if let Some(other) = unique.iter().find(|r| r.table != table) {
+            return Err(Error::NoSuchRow(*other));
+        }
+        if unique.is_empty() {
+            return Ok(());
+        }
+        self.edit(|tx| {
+            let cols: Vec<String> = t.columns.iter().map(|c| quote(&c.name)).collect();
+            let sql = format!(
+                "SELECT {} FROM {} WHERE {} = ?1",
+                cols.join(", "),
+                quote(&t.name),
+                quote(ROW_ID)
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let mut stored_rows = Vec::with_capacity(unique.len());
+            for row in &unique {
+                let values = stmt
+                    .query_row([row.id], |r| {
+                        t.columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| Ok((c.id, r.get::<_, SqlValue>(i)?)))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .optional()?
+                    .ok_or(Error::NoSuchRow(*row))?;
+                stored_rows.push(StoredRow { id: row.id, values });
+            }
+            Ok((
+                vec![Change::DeleteRows {
+                    table,
+                    rows: stored_rows,
+                }],
+                (),
+            ))
+        })
+        .map_err(|e| corrupt_if_out_of_sync(&t, e))
+    }
+}
+
+/// [`out_of_sync`] for errors that have already become an [`Error`].
+fn corrupt_if_out_of_sync(t: &Table, e: Error) -> Error {
+    match e {
+        Error::Sqlite(e) => out_of_sync(t, e),
+        e => e,
     }
 }
 
