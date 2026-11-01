@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::error::{Error, Result};
 use crate::workbook::Workbook;
@@ -27,7 +27,7 @@ CREATE TABLE xel_columns (
 CREATE TABLE xel_select_options (
     column_id INTEGER NOT NULL REFERENCES xel_columns (id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
-    value TEXT NOT NULL,
+    value TEXT NOT NULL COLLATE NOCASE,
     PRIMARY KEY (column_id, position),
     UNIQUE (column_id, value)
 ) STRICT;
@@ -35,6 +35,10 @@ CREATE TABLE xel_select_options (
 
 /// The longest table or column name accepted, in characters.
 const MAX_NAME: usize = 255;
+
+/// Names SQLite gives the implicit row id. A user column with one of them would hide
+/// the row id, and SQLite refuses to rename or drop it later.
+const ROWID_ALIASES: [&str; 3] = ["rowid", "oid", "_rowid_"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TableId(pub(crate) i64);
@@ -119,76 +123,23 @@ pub struct Table {
 impl Workbook {
     /// Every table with its columns, in display order.
     pub fn tables(&self) -> Result<Vec<Table>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, name FROM xel_tables ORDER BY position")?;
-        let heads: Vec<(i64, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        heads
-            .into_iter()
-            .map(|(id, name)| {
-                let columns = self.columns(TableId(id))?;
-                Ok(Table {
-                    id: TableId(id),
-                    name,
-                    columns,
-                })
-            })
-            .collect()
+        load_tables(&self.conn, None)
     }
 
     pub fn table(&self, id: TableId) -> Result<Table> {
-        let name: String = self
-            .conn
-            .query_row("SELECT name FROM xel_tables WHERE id = ?1", [id.0], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .ok_or(Error::NoSuchTable(id))?;
-        Ok(Table {
-            id,
-            name,
-            columns: self.columns(id)?,
-        })
-    }
-
-    fn columns(&self, table: TableId) -> Result<Vec<Column>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, type FROM xel_columns WHERE table_id = ?1 ORDER BY position",
-        )?;
-        let rows: Vec<(i64, String, String)> = stmt
-            .query_map([table.0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        let mut opts = self.conn.prepare(
-            "SELECT value FROM xel_select_options WHERE column_id = ?1 ORDER BY position",
-        )?;
-        rows.into_iter()
-            .map(|(id, name, ty)| {
-                let options = opts
-                    .query_map([id], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?;
-                Ok(Column {
-                    id: ColumnId(id),
-                    name,
-                    ty: ColumnType::parse(&ty)?,
-                    options,
-                })
-            })
-            .collect()
+        load_tables(&self.conn, Some(id))?
+            .pop()
+            .ok_or(Error::NoSuchTable(id))
     }
 
     /// Creates a table with at least one column. SQLite has no column-less tables.
     pub fn create_table(&mut self, name: &str, columns: &[(&str, ColumnType)]) -> Result<TableId> {
         check_table_name(name)?;
         if columns.is_empty() {
-            return Err(Error::InvalidName {
-                name: name.into(),
-                reason: "a table needs at least one column".into(),
-            });
+            return Err(Error::NoColumns);
         }
         for (i, (col, _)) in columns.iter().enumerate() {
-            check_name(col)?;
+            check_column_name(col)?;
             // SQLite identifiers are case-insensitive for ASCII only.
             if columns[..i]
                 .iter()
@@ -197,8 +148,8 @@ impl Workbook {
                 return Err(Error::DuplicateName((*col).into()));
             }
         }
-        let tx = self.conn.transaction()?;
-        ensure_table_name_free(&tx, name, None)?;
+        let tx = self.write()?;
+        ensure_table_name_free(&tx, name)?;
         let defs: Vec<String> = columns.iter().map(|(c, ty)| ty.sql(&quote(c))).collect();
         tx.execute_batch(&format!(
             "CREATE TABLE {} ({}) STRICT;",
@@ -223,10 +174,12 @@ impl Workbook {
 
     pub fn rename_table(&mut self, id: TableId, new_name: &str) -> Result<()> {
         check_table_name(new_name)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         let old = table_name(&tx, id)?;
-        ensure_table_name_free(&tx, new_name, Some(id))?;
-        if old.eq_ignore_ascii_case(new_name) && old != new_name {
+        if old == new_name {
+            return Ok(());
+        }
+        if old.eq_ignore_ascii_case(new_name) {
             // SQLite sees a case-only change as renaming onto an existing table, so step
             // through a name no user table can have.
             let step = quote(&format!("xel_rename_{}", id.0));
@@ -236,6 +189,7 @@ impl Workbook {
                 quote(new_name)
             ))?;
         } else {
+            ensure_table_name_free(&tx, new_name)?;
             tx.execute_batch(&format!(
                 "ALTER TABLE {} RENAME TO {};",
                 quote(&old),
@@ -251,7 +205,7 @@ impl Workbook {
     }
 
     pub fn delete_table(&mut self, id: TableId) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.write()?;
         let name = table_name(&tx, id)?;
         tx.execute_batch(&format!("DROP TABLE {};", quote(&name)))?;
         tx.execute("DELETE FROM xel_tables WHERE id = ?1", [id.0])?;
@@ -261,8 +215,8 @@ impl Workbook {
 
     /// Adds a column at the end of the table.
     pub fn add_column(&mut self, table: TableId, name: &str, ty: ColumnType) -> Result<ColumnId> {
-        check_name(name)?;
-        let tx = self.conn.transaction()?;
+        check_column_name(name)?;
+        let tx = self.write()?;
         let tname = table_name(&tx, table)?;
         ensure_column_name_free(&tx, table, name, None)?;
         tx.execute_batch(&format!(
@@ -281,15 +235,18 @@ impl Workbook {
     }
 
     pub fn rename_column(&mut self, id: ColumnId, new_name: &str) -> Result<()> {
-        check_name(new_name)?;
-        let tx = self.conn.transaction()?;
-        let (table, old) = column_owner(&tx, id)?;
-        ensure_column_name_free(&tx, table, new_name, Some(id))?;
-        let tname = table_name(&tx, table)?;
+        check_column_name(new_name)?;
+        let tx = self.write()?;
+        let info = column_info(&tx, id)?;
+        if info.name == new_name {
+            return Ok(());
+        }
+        ensure_column_name_free(&tx, info.table, new_name, Some(id))?;
+        let tname = table_name(&tx, info.table)?;
         tx.execute_batch(&format!(
             "ALTER TABLE {} RENAME COLUMN {} TO {};",
             quote(&tname),
-            quote(&old),
+            quote(&info.name),
             quote(new_name)
         ))?;
         tx.execute(
@@ -303,21 +260,21 @@ impl Workbook {
     /// Deletes a column and its data. A table's last column cannot be deleted; delete the
     /// table instead.
     pub fn delete_column(&mut self, id: ColumnId) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        let (table, name) = column_owner(&tx, id)?;
+        let tx = self.write()?;
+        let info = column_info(&tx, id)?;
         let count: i64 = tx.query_row(
             "SELECT count(*) FROM xel_columns WHERE table_id = ?1",
-            [table.0],
+            [info.table.0],
             |r| r.get(0),
         )?;
         if count == 1 {
             return Err(Error::LastColumn(id));
         }
-        let tname = table_name(&tx, table)?;
+        let tname = table_name(&tx, info.table)?;
         tx.execute_batch(&format!(
             "ALTER TABLE {} DROP COLUMN {};",
             quote(&tname),
-            quote(&name)
+            quote(&info.name)
         ))?;
         tx.execute("DELETE FROM xel_columns WHERE id = ?1", [id.0])?;
         tx.commit()?;
@@ -326,14 +283,14 @@ impl Workbook {
 
     /// Replaces a select column's options. Values already stored are not changed.
     pub fn set_select_options(&mut self, id: ColumnId, options: &[&str]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        let ty: String = tx
-            .query_row("SELECT type FROM xel_columns WHERE id = ?1", [id.0], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .ok_or(Error::NoSuchColumn(id))?;
-        if ColumnType::parse(&ty)? != ColumnType::Select {
+        for (i, option) in options.iter().enumerate() {
+            check_name(option)?;
+            if options[..i].iter().any(|o| o.eq_ignore_ascii_case(option)) {
+                return Err(Error::DuplicateName((*option).into()));
+            }
+        }
+        let tx = self.write()?;
+        if column_info(&tx, id)?.ty != ColumnType::Select {
             return Err(Error::NotASelectColumn(id));
         }
         tx.execute(
@@ -344,17 +301,63 @@ impl Workbook {
             tx.execute(
                 "INSERT INTO xel_select_options (column_id, position, value) VALUES (?1, ?2, ?3)",
                 params![id.0, pos, value],
-            )
-            .map_err(|e| match e.sqlite_error_code() {
-                Some(rusqlite::ErrorCode::ConstraintViolation) => {
-                    Error::DuplicateName((*value).into())
-                }
-                _ => e.into(),
-            })?;
+            )?;
         }
         tx.commit()?;
         Ok(())
     }
+
+    /// Starts a write transaction. IMMEDIATE takes the write lock up front, so a schema
+    /// change that reads before it writes cannot fail half-way on a lock upgrade.
+    pub(crate) fn write(&mut self) -> Result<Transaction<'_>> {
+        Ok(self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?)
+    }
+}
+
+/// Loads every table, or just `only`, with columns and options in one query.
+fn load_tables(conn: &Connection, only: Option<TableId>) -> Result<Vec<Table>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, c.id, c.name, c.type, o.value
+         FROM xel_tables t
+         LEFT JOIN xel_columns c ON c.table_id = t.id
+         LEFT JOIN xel_select_options o ON o.column_id = c.id
+         WHERE ?1 IS NULL OR t.id = ?1
+         ORDER BY t.position, c.position, o.position",
+    )?;
+    let mut rows = stmt.query([only.map(|t| t.0)])?;
+    let mut tables: Vec<Table> = Vec::new();
+    while let Some(r) = rows.next()? {
+        let table = TableId(r.get(0)?);
+        if tables.last().is_none_or(|t| t.id != table) {
+            tables.push(Table {
+                id: table,
+                name: r.get(1)?,
+                columns: Vec::new(),
+            });
+        }
+        let Some(col) = r.get::<_, Option<i64>>(2)? else {
+            continue;
+        };
+        let columns = &mut tables.last_mut().expect("pushed above").columns;
+        if columns.last().is_none_or(|c| c.id.0 != col) {
+            columns.push(Column {
+                id: ColumnId(col),
+                name: r.get(3)?,
+                ty: ColumnType::parse(&r.get::<_, String>(4)?)?,
+                options: Vec::new(),
+            });
+        }
+        if let Some(option) = r.get::<_, Option<String>>(5)? {
+            columns
+                .last_mut()
+                .expect("pushed above")
+                .options
+                .push(option);
+        }
+    }
+    Ok(tables)
 }
 
 /// Quotes an identifier for SQL, doubling embedded quotes.
@@ -384,9 +387,23 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn check_column_name(name: &str) -> Result<()> {
+    check_name(name)?;
+    if ROWID_ALIASES
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(name))
+    {
+        return Err(Error::InvalidName {
+            name: name.into(),
+            reason: "rowid, oid, and _rowid_ are reserved by SQLite".into(),
+        });
+    }
+    Ok(())
+}
+
 fn check_table_name(name: &str) -> Result<()> {
     check_name(name)?;
-    let lower = name.to_lowercase();
+    let lower = name.to_ascii_lowercase();
     if lower.starts_with("sqlite_") || lower.starts_with("xel_") {
         return Err(Error::InvalidName {
             name: name.into(),
@@ -396,33 +413,40 @@ fn check_table_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn table_name(tx: &Transaction<'_>, id: TableId) -> Result<String> {
-    tx.query_row("SELECT name FROM xel_tables WHERE id = ?1", [id.0], |r| {
+fn table_name(conn: &Connection, id: TableId) -> Result<String> {
+    conn.query_row("SELECT name FROM xel_tables WHERE id = ?1", [id.0], |r| {
         r.get(0)
     })
     .optional()?
     .ok_or(Error::NoSuchTable(id))
 }
 
-fn column_owner(tx: &Transaction<'_>, id: ColumnId) -> Result<(TableId, String)> {
-    tx.query_row(
-        "SELECT table_id, name FROM xel_columns WHERE id = ?1",
-        [id.0],
-        |r| Ok((TableId(r.get(0)?), r.get(1)?)),
-    )
-    .optional()?
-    .ok_or(Error::NoSuchColumn(id))
+struct ColumnInfo {
+    table: TableId,
+    name: String,
+    ty: ColumnType,
+}
+
+fn column_info(conn: &Connection, id: ColumnId) -> Result<ColumnInfo> {
+    let (table, name, ty): (i64, String, String) = conn
+        .query_row(
+            "SELECT table_id, name, type FROM xel_columns WHERE id = ?1",
+            [id.0],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(Error::NoSuchColumn(id))?;
+    Ok(ColumnInfo {
+        table: TableId(table),
+        name,
+        ty: ColumnType::parse(&ty)?,
+    })
 }
 
 /// Table names share SQLite's namespace with every other schema object, so check all of
-/// them, case-insensitively as SQLite does.
-fn ensure_table_name_free(tx: &Transaction<'_>, name: &str, except: Option<TableId>) -> Result<()> {
-    if let Some(id) = except
-        && table_name(tx, id)?.eq_ignore_ascii_case(name)
-    {
-        return Ok(());
-    }
-    let taken: bool = tx.query_row(
+/// them, case-insensitively for ASCII as SQLite does.
+fn ensure_table_name_free(conn: &Connection, name: &str) -> Result<()> {
+    let taken: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE lower(name) = lower(?1))",
         [name],
         |r| r.get(0),
@@ -435,12 +459,12 @@ fn ensure_table_name_free(tx: &Transaction<'_>, name: &str, except: Option<Table
 }
 
 fn ensure_column_name_free(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     table: TableId,
     name: &str,
     except: Option<ColumnId>,
 ) -> Result<()> {
-    let taken: bool = tx.query_row(
+    let taken: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM xel_columns \
          WHERE table_id = ?1 AND name = ?2 AND id IS NOT ?3)",
         params![table.0, name, except.map(|c| c.0)],
@@ -674,11 +698,92 @@ mod tests {
         ));
         assert!(matches!(
             book.create_table("Empty", &[]),
-            Err(Error::InvalidName { .. })
+            Err(Error::NoColumns)
         ));
         // Renaming to a different case of the same name is allowed.
         book.rename_table(t, "ORDERS").unwrap();
         assert_eq!(book.table(t).unwrap().name, "ORDERS");
+    }
+
+    #[test]
+    fn rowid_aliases_are_not_column_names() {
+        let dir = TempDir::new();
+        let (mut book, _) = book(&dir);
+        for alias in ["rowid", "ROWID", "oid", "_rowid_"] {
+            assert!(
+                matches!(
+                    book.create_table("T", &[(alias, ColumnType::Text)]),
+                    Err(Error::InvalidName { .. })
+                ),
+                "{alias}"
+            );
+        }
+        let t = book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        let a = book.table(t).unwrap().columns[0].id;
+        assert!(matches!(
+            book.add_column(t, "oid", ColumnType::Text),
+            Err(Error::InvalidName { .. })
+        ));
+        assert!(matches!(
+            book.rename_column(a, "rowid"),
+            Err(Error::InvalidName { .. })
+        ));
+    }
+
+    #[test]
+    fn renaming_to_the_same_name_is_a_no_op() {
+        let dir = TempDir::new();
+        let (mut book, _) = book(&dir);
+        let t = book
+            .create_table("Orders", &[("Id", ColumnType::Number)])
+            .unwrap();
+        let id = book.table(t).unwrap().columns[0].id;
+        book.rename_table(t, "Orders").unwrap();
+        book.rename_column(id, "Id").unwrap();
+        assert_eq!(book.table(t).unwrap().name, "Orders");
+    }
+
+    #[test]
+    fn a_reader_holding_the_file_delays_a_write_instead_of_failing_it() {
+        let dir = TempDir::new();
+        let (mut book, path) = book(&dir);
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM xel_tables;")
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            reader.execute_batch("COMMIT").unwrap();
+        });
+        book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn tables_load_with_columns_and_options_in_order() {
+        let dir = TempDir::new();
+        let (mut book, _) = book(&dir);
+        let a = book
+            .create_table("A", &[("x", ColumnType::Select), ("y", ColumnType::Text)])
+            .unwrap();
+        book.create_table("B", &[("z", ColumnType::Number)])
+            .unwrap();
+        let x = book.table(a).unwrap().columns[0].id;
+        book.set_select_options(x, &["c", "a", "b"]).unwrap();
+        let shape: Vec<String> = book
+            .tables()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let cols: Vec<String> = t
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}{:?}", c.name, c.options))
+                    .collect();
+                format!("{}: {}", t.name, cols.join(" "))
+            })
+            .collect();
+        assert_eq!(shape, ["A: x[\"c\", \"a\", \"b\"] y[]", "B: z[]"]);
     }
 
     #[test]
@@ -739,10 +844,9 @@ mod tests {
             book.table(t).unwrap().columns[0].options,
             ["High", "Low", "Medium"]
         );
-        assert!(matches!(
-            book.set_select_options(cols[0].id, &["a", "a"]),
-            Err(Error::DuplicateName(_))
-        ));
+        for bad in [&["a", "A"][..], &[""], &["  x"], &["a\nb"]] {
+            assert!(book.set_select_options(cols[0].id, bad).is_err(), "{bad:?}");
+        }
         assert_eq!(
             book.table(t).unwrap().columns[0].options,
             ["High", "Low", "Medium"],

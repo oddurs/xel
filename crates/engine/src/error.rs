@@ -38,6 +38,8 @@ pub enum Error {
     NoSuchTable(TableId),
     #[error("column {0:?} does not exist")]
     NoSuchColumn(ColumnId),
+    #[error("a table needs at least one column")]
+    NoColumns,
     #[error("a table must keep at least one column; delete the table instead")]
     LastColumn(ColumnId),
     #[error("column {0:?} is not a select column")]

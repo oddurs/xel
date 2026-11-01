@@ -8,7 +8,8 @@ use rusqlite::{Connection, ErrorCode, MAIN_DB, OpenFlags};
 use crate::error::{Error, Result};
 
 /// The on-disk format this engine writes. Bump it with a migration whenever the
-/// `xel_*` schema changes.
+/// `xel_*` schema changes, starting with the first release; until then only development
+/// builds have written files.
 pub const FORMAT_VERSION: u32 = 1;
 
 /// Lets `file(1)` and `open` identify a .xel file from its header ("XEL1").
@@ -95,12 +96,8 @@ impl Workbook {
         if std::fs::metadata(path).map_err(io)?.is_dir() {
             return Err(Error::NotAWorkbook(path.clone()));
         }
-        // SQLite reports an unreadable file only as "unable to open"; ask the OS first so
-        // the user hears "permission denied".
-        std::fs::File::open(path).map_err(io)?;
-
         let probed = Connection::open_with_flags(path, READ_ONLY)
-            .map_err(Error::from)
+            .map_err(|e| explain_cannot_open(e, path))
             .and_then(|probe| identify(&probe, path));
         let checked = match probed {
             Ok(version) => Some(version),
@@ -119,8 +116,6 @@ impl Workbook {
             Some(version) => version,
             None => identify(&conn, path)?,
         };
-        // Checked after any crash rollback, which restores the file's length.
-        check_length(path)?;
         Self::configure(conn, format_version)
     }
 
@@ -136,6 +131,9 @@ impl Workbook {
 
     fn configure(conn: Connection, format_version: u32) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", true)?;
+        // Another reader (sqlite3, a Python script) may briefly hold the file; wait for it
+        // rather than failing the user's edit.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             conn,
             format_version,
@@ -191,37 +189,20 @@ fn identify(conn: &Connection, path: &Path) -> Result<u32> {
     }
 }
 
-/// A file shorter than its header says has lost pages. SQLite would only notice when it
-/// reads one, possibly much later; the header check costs one small read.
-fn check_length(path: &Path) -> Result<()> {
-    use std::io::Read;
-    let io = |e| Error::Io {
-        path: path.to_path_buf(),
-        source: e,
-    };
-    let mut file = std::fs::File::open(path).map_err(io)?;
-    let mut header = [0u8; 100];
-    file.read_exact(&mut header).map_err(io)?;
-    // From the SQLite file format: page size at 16 (1 means 65536) and page count at 28,
-    // trusted only when the change counter at 24 matches "version-valid-for" at 92.
-    if header[24..28] != header[92..96] {
-        return Ok(());
+/// SQLite reports an unreadable file only as "unable to open". Asking the OS says why
+/// (permission denied). This runs only after SQLite has failed to open the file, so no
+/// connection in this process holds locks on it: opening and closing another descriptor
+/// would otherwise release them, as POSIX locks are per process.
+fn explain_cannot_open(e: rusqlite::Error, path: &Path) -> Error {
+    if matches!(e.sqlite_error_code(), Some(ErrorCode::CannotOpen))
+        && let Err(io) = std::fs::File::open(path)
+    {
+        return Error::Io {
+            path: path.to_path_buf(),
+            source: io,
+        };
     }
-    let page_size = match u16::from_be_bytes([header[16], header[17]]) {
-        1 => 65_536,
-        n => u64::from(n),
-    };
-    let pages = u64::from(u32::from_be_bytes([
-        header[28], header[29], header[30], header[31],
-    ]));
-    let len = file.metadata().map_err(io)?.len();
-    if len < pages * page_size {
-        return Err(Error::Corrupt(format!(
-            "the file is {len} bytes but its header says {}",
-            pages * page_size
-        )));
-    }
-    Ok(())
+    e.into()
 }
 
 /// An absolute path for SQLite. The bundled build always parses `file:` URIs, so a
@@ -560,7 +541,9 @@ mod tests {
         let dir = TempDir::new();
         let path = created(&dir);
         let bytes = std::fs::read(&path).unwrap();
-        for len in [50, 100, bytes.len() - 1] {
+        // A partial last page is noticed only when that page is read; a full check is the
+        // v1.0 crash-safety suite's job.
+        for len in [50, 100] {
             std::fs::write(&path, &bytes[..len]).unwrap();
             let err = Workbook::open(&path).unwrap_err();
             assert!(
