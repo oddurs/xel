@@ -236,17 +236,10 @@ columns = ["id", "type", "title", "created"]
 # Hooks run after the change is on disk, so a failing hook warns but never rolls
 # anything back. Suppress them with --no-hooks or CAIRN_NO_HOOKS=1.
 
-# Keeping the rendered roadmap current is the tool's whole point, so it is done
-# for you. Comment these out if you would rather render by hand — but a roadmap
-# that drifts from the items is the rot cairn exists to prevent, and leaving it
-# to discipline is how it starts.
-
-[hooks]
-after-create = "cairn render -q"
-after-change = "cairn render -q"
-after-remove = "cairn render -q"
-# after-render = "git add ROADMAP.md"
-# after-change = ["python3", "scripts/notify.py"]   # portable form
+# ROADMAP.md is not rendered on every change. Its progress lines change with every closed
+# item, so rendering inside item PRs makes any two PRs in flight conflict, and GitHub
+# cannot resolve that when it rebases an auto-merge PR. Render it in its own PR instead:
+# `cairn render`, then ship it as a docs change.
 
 # ─── Rendered roadmap ────────────────────────────────────────────────────────
 

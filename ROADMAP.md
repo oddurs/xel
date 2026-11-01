@@ -4,7 +4,7 @@
 
 ## v0.1 — Typed tables, saved as SQLite
 
-`#·········` 3% · 1 of 37 done · due 2027-01-31
+`#·········` 5% · 2 of 37 done · due 2027-01-31
 
 A Mac user downloads xel, builds a workbook of typed tables (typed in or imported from CSV), computes with Excel-style column formulas and total rows, and saves a .xel file that `sqlite3` reads directly.
 
@@ -14,7 +14,6 @@ A Mac user downloads xel, builds a workbook of typed tables (typed in or importe
 - [ ] [`0008`](https://github.com/oddurs/xel/blob/main/cairn/items/0008-choose-how-the-grid-renders-a-million-rows.md) Choose how the grid renders a million rows <sup>spike · p0 · grid</sup>
 - [ ] [`0010`](https://github.com/oddurs/xel/blob/main/cairn/items/0010-decide-where-formula-column-values-live.md) Decide where formula column values live <sup>spike · p0 · recalc</sup>
 - [ ] [`0011`](https://github.com/oddurs/xel/blob/main/cairn/items/0011-prove-nsdocument-can-own-a-sqlite-file-safely.md) Prove NSDocument can own a SQLite file safely <sup>spike · p0 · app</sup>
-- [ ] [`0013`](https://github.com/oddurs/xel/blob/main/cairn/items/0013-create-and-open-xel-workbooks-as-sqlite-files.md) Create and open .xel workbooks as SQLite files <sup>feature · p0 · format</sup>
 - [ ] [`0014`](https://github.com/oddurs/xel/blob/main/cairn/items/0014-typed-tables-stored-as-real-sql-tables.md) Typed tables stored as real SQL tables <sup>feature · p0 · format</sup>
 - [ ] [`0015`](https://github.com/oddurs/xel/blob/main/cairn/items/0015-insert-edit-and-delete-rows-with-type-checking.md) Insert, edit, and delete rows with type checking <sup>feature · p0 · format</sup>
 - [ ] [`0016`](https://github.com/oddurs/xel/blob/main/cairn/items/0016-undo-and-redo-for-every-engine-edit.md) Undo and redo for every engine edit <sup>feature · p0 · format</sup>
@@ -53,6 +52,7 @@ A Mac user downloads xel, builds a workbook of typed tables (typed in or importe
 ### done
 
 - [x] [`0009`](https://github.com/oddurs/xel/blob/main/cairn/items/0009-decide-the-number-model.md) Decide the number model <sup>spike · p0 · formula</sup>
+- [x] [`0013`](https://github.com/oddurs/xel/blob/main/cairn/items/0013-create-and-open-xel-workbooks-as-sqlite-files.md) Create and open .xel workbooks as SQLite files <sup>feature · p0 · format</sup>
 
 ## v0.2 — Linked tables, SQL, and free cells
 

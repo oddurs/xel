@@ -12,6 +12,8 @@ A local-first macOS spreadsheet where the file is a database. Rust engine in
   `scripts/agent start <type>/<id>-<slug>`, for example `feat/0013-open-workbooks`, and
   `cd` to the printed path. `type` is one of `feat fix chore docs perf refactor test`.
   Spikes use `chore/`. Close the item in the same PR that finishes it.
+  Do not run `cairn render` in an item PR; `ROADMAP.md` is re-rendered in its own
+  `docs: render roadmap` PR, because rendering in every PR makes them conflict.
 - Commit: `scripts/agent commit "<message>"`.
 - Finish: `scripts/agent ship --body-file <path>`, with the body written from the PR
   template. It opens the PR, enables auto-merge, keeps the branch current, waits for
