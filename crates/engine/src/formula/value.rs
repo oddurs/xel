@@ -1,13 +1,18 @@
 //! Formula values and Excel's rules for converting between them.
 //!
-//! Numbers follow the model decided in 0009: IEEE doubles, `#NUM!` for anything
-//! non-finite, no negative zero, and equality at 15 significant digits.
+//! Numbers follow the model decided in 0009: IEEE doubles, `#NUM!` for anything Excel
+//! cannot hold, no negative zero, and equality at 15 significant digits.
 
 use std::cmp::Ordering;
 
 use super::ast::{BinaryOp, ErrorKind, UnaryOp};
 
+/// Excel's largest number, 9.99999999999999E+307. Larger results are `#NUM!`.
+const MAX_NUMBER: f64 = 9.999_999_999_999_99e307;
+
 /// A value produced or consumed by a formula.
+///
+/// `PartialEq` is structural (`Text("a") != Text("A")`); Excel's `=` is [`compare`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// An empty cell. Reads as 0, "", or FALSE depending on what wants it.
@@ -17,25 +22,22 @@ pub enum Value {
     Bool(bool),
     /// An Excel date serial (days since 1899-12-31, with Excel's phantom 1900-02-29).
     /// It is a number to every operator; it only remembers that it is a date, so
-    /// `TODAY()+1` stays a date while `B2-A2` becomes a count of days.
+    /// `TODAY()+1` stays a date while `B2-A2` becomes a count of days, and a formula
+    /// column can infer that its results are dates.
     Date(f64),
     Error(ErrorKind),
 }
 
 impl Value {
-    /// A number result, applying the number model: non-finite becomes `#NUM!` and
-    /// negative zero becomes zero.
+    /// A number result, applying the number model: beyond Excel's range or non-finite
+    /// becomes `#NUM!`; subnormals and negative zero become zero.
     #[must_use]
     pub fn number(n: f64) -> Self {
-        Self::finite(n).map_or(Self::Error(ErrorKind::Num), Self::Number)
+        normalize(n).map_or(Self::Error(ErrorKind::Num), Self::Number)
     }
 
     fn date(n: f64) -> Self {
-        Self::finite(n).map_or(Self::Error(ErrorKind::Num), Self::Date)
-    }
-
-    fn finite(n: f64) -> Option<f64> {
-        n.is_finite().then_some(if n == 0.0 { 0.0 } else { n })
+        normalize(n).map_or(Self::Error(ErrorKind::Num), Self::Date)
     }
 
     /// The value as a number, as arithmetic sees it.
@@ -60,6 +62,15 @@ impl Value {
             Self::Error(e) => Err(*e),
         }
     }
+}
+
+/// `None` for what Excel cannot hold. Values below the smallest normal double flush to
+/// zero, as Excel's documented minimum is 2.2251E-308.
+fn normalize(n: f64) -> Option<f64> {
+    if !n.is_finite() || n.abs() > MAX_NUMBER {
+        return None;
+    }
+    Some(if n.abs() < f64::MIN_POSITIVE { 0.0 } else { n })
 }
 
 /// Applies a unary operator.
@@ -123,8 +134,8 @@ pub fn binary(op: BinaryOp, a: &Value, b: &Value) -> Value {
     }
 }
 
-/// Excel's `^`: 0^0 and a negative base with a fractional exponent are `#NUM!`; zero to
-/// a negative power is `#DIV/0!`.
+/// Excel's `^`: 0^0 is `#NUM!`, zero to a negative power is `#DIV/0!`, and anything
+/// without a real result (a negative base with a fractional power) is `#NUM!`.
 fn power(x: f64, y: f64) -> Value {
     if x == 0.0 && y == 0.0 {
         return Value::Error(ErrorKind::Num);
@@ -146,75 +157,98 @@ pub fn compare(a: &Value, b: &Value) -> Result<Ordering, ErrorKind> {
     if let Error(e) = b {
         return Err(*e);
     }
+    // An empty side becomes the other side's blank value, then the general rules apply.
+    let blank_like = |other: &Value| match other {
+        Text(_) => Text(String::new()),
+        Bool(_) => Bool(false),
+        _ => Number(0.0),
+    };
+    let (a, b) = match (a, b) {
+        (Empty, Empty) => return Ok(Ordering::Equal),
+        (Empty, b) => (&blank_like(b), b),
+        (a, Empty) => (a, &blank_like(a)),
+        (a, b) => (a, b),
+    };
     let rank = |v: &Value| match v {
-        Number(_) | Date(_) => 0,
+        Number(_) | Date(_) | Empty | Error(_) => 0,
         Text(_) => 1,
         Bool(_) => 2,
-        Empty | Error(_) => unreachable!("handled before ranking"),
     };
     Ok(match (a, b) {
-        (Empty, Empty) => Ordering::Equal,
-        (Empty, Number(_) | Date(_)) => compare_numbers(0.0, b.to_number()?),
-        (Number(_) | Date(_), Empty) => compare_numbers(a.to_number()?, 0.0),
-        (Empty, Text(t)) => compare_text("", t),
-        (Text(t), Empty) => compare_text(t, ""),
-        (Empty, Bool(x)) => false.cmp(x),
-        (Bool(x), Empty) => x.cmp(&false),
-        (Number(_) | Date(_), Number(_) | Date(_)) => {
-            compare_numbers(a.to_number()?, b.to_number()?)
-        }
+        (Number(x) | Date(x), Number(y) | Date(y)) => compare_numbers(*x, *y),
         (Text(x), Text(y)) => compare_text(x, y),
         (Bool(x), Bool(y)) => x.cmp(y),
         _ => rank(a).cmp(&rank(b)),
     })
 }
 
+#[expect(clippy::float_cmp, reason = "exact equality is only the fast path")]
 fn compare_numbers(x: f64, y: f64) -> Ordering {
-    round15(x).total_cmp(&round15(y))
+    if x == y {
+        return Ordering::Equal;
+    }
+    round15(x)
+        .partial_cmp(&round15(y))
+        .unwrap_or(Ordering::Equal)
 }
 
+/// Case-insensitive, with Excel's broad order of character classes: spaces and
+/// punctuation, then digits, then letters. Within a class, characters compare by their
+/// lowercase code point; Excel's accent-aware collation is a later refinement.
 fn compare_text(x: &str, y: &str) -> Ordering {
-    x.to_lowercase().cmp(&y.to_lowercase())
+    if x == y {
+        return Ordering::Equal;
+    }
+    let key = |c: char| {
+        let class = if c.is_alphabetic() {
+            2
+        } else {
+            u8::from(c.is_numeric())
+        };
+        (class, c.to_lowercase().next().unwrap_or(c))
+    };
+    x.chars().map(key).cmp(y.chars().map(key))
 }
 
 /// Rounds to 15 significant digits, the precision Excel shows and compares at.
 #[must_use]
 pub fn round15(n: f64) -> f64 {
-    if n == 0.0 || !n.is_finite() {
+    if n == 0.0 {
+        return 0.0;
+    }
+    if !n.is_finite() {
         return n;
     }
-    // Scientific formatting with 14 fraction digits rounds to 15 significant digits,
-    // and Rust always parses what it formats.
-    format!("{n:.14e}").parse().unwrap_or(n)
+    // Scientific formatting with 14 fraction digits rounds to 15 significant digits.
+    // Near f64::MAX the rounded text can parse as infinity; keep the original then.
+    match format!("{n:.14e}").parse::<f64>() {
+        Ok(r) if r.is_finite() => r,
+        _ => n,
+    }
 }
 
 /// Excel's General format, as used when a number becomes text: up to 15 significant
-/// digits, trailing zeros dropped, scientific notation for very large or very small
-/// magnitudes (`1E+15`, `1.5E-10`).
+/// digits, trailing zeros dropped, scientific notation for magnitudes of 1E+15 and above
+/// or below 1E-9 (`1E+15`, `1.5E-10`).
 #[must_use]
 pub fn general(n: f64) -> String {
-    let r = round15(n);
-    if r == 0.0 {
+    if !n.is_finite() {
+        return ErrorKind::Num.as_str().into();
+    }
+    if n == 0.0 {
         return "0".into();
     }
-    let magnitude = r.abs();
-    if !(1e-9..1e15).contains(&magnitude) {
-        // `{:E}` always yields "<mantissa>E<exponent>".
-        let s = format!("{r:.14E}");
-        let (mantissa, exponent) = s.split_once('E').unwrap_or((&s, "0"));
-        let mantissa = trim_fraction(mantissa);
-        let exponent: i32 = exponent.parse().unwrap_or(0);
+    // The decimal exponent of the 15-digit rounding decides the layout. Taking it from
+    // the formatted text, not log10, keeps 99999999999999.9 from becoming 1E+14.
+    let sci = format!("{n:.14e}");
+    let (mantissa, exponent) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    if !(-9..15).contains(&exponent) {
         let sign = if exponent < 0 { '-' } else { '+' };
-        return format!("{mantissa}E{sign}{:02}", exponent.abs());
+        return format!("{}E{sign}{:02}", trim_fraction(mantissa), exponent.abs());
     }
-    // Digits after the point that keep 15 significant digits in total. The magnitude
-    // range above bounds this to 0..=23.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "log10 of a value in 1e-9..1e15"
-    )]
-    let int_digits = magnitude.log10().floor() as i32 + 1;
-    let decimals = usize::try_from(15 - int_digits).unwrap_or(0);
+    let decimals = usize::try_from(14 - exponent).unwrap_or(0);
+    let r = round15(n);
     trim_fraction(&format!("{r:.decimals$}")).to_string()
 }
 
@@ -226,23 +260,26 @@ fn trim_fraction(s: &str) -> &str {
     }
 }
 
-/// Text that arithmetic accepts as a number, as Excel does: surrounding spaces, a sign
-/// or parentheses for negatives, a leading `$`, thousands separators in groups of three,
-/// a decimal point, an exponent, a trailing `%`, or an ISO date (`2024-01-31`).
+/// Text that arithmetic accepts as a number, as Excel does in the en-US locale:
+/// surrounding spaces, a sign or parentheses for negatives, a leading `$`, thousands
+/// separators in groups of three, a decimal point, an exponent, a trailing `%`, a date
+/// (`2024-01-31`, `2024-1-31`, `6/1/2001`), or a time of day (`12:00`, `08:30:15`).
 #[must_use]
 pub fn number_from_text(s: &str) -> Option<f64> {
     let s = s.trim_matches(' ');
-    if let Some(serial) = serial_from_iso(s) {
-        return Some(serial);
+    if let Some(n) = serial_from_date_text(s).or_else(|| fraction_from_time(s)) {
+        return Some(n);
     }
-    let (negative, s) = match s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+    let (in_parens, s) = match s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
         Some(inner) => (true, inner),
         None => (false, s),
     };
     let (sign, s) = match s.as_bytes().first() {
+        // A sign inside parentheses is not a number: "(-5)" is #VALUE!.
+        Some(b'-' | b'+') if in_parens => return None,
         Some(b'-') => (-1.0, &s[1..]),
         Some(b'+') => (1.0, &s[1..]),
-        _ => (1.0, s),
+        _ => (if in_parens { -1.0 } else { 1.0 }, s),
     };
     let s = s.strip_prefix('$').unwrap_or(s);
     let (percent, s) = match s.strip_suffix('%') {
@@ -250,25 +287,21 @@ pub fn number_from_text(s: &str) -> Option<f64> {
         None => (false, s),
     };
     let plain = strip_thousands(s)?;
-    if plain.is_empty()
-        || !plain
-            .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
-        || !plain
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_digit() || b == b'.')
-    {
+    let starts_well = plain
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_digit() || b == b'.');
+    let only_number_chars = plain
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'));
+    if !starts_well || !only_number_chars {
         return None;
     }
     let mut n: f64 = plain.parse().ok()?;
     if percent {
         n /= 100.0;
     }
-    if negative {
-        n = -n;
-    }
-    Value::finite(sign * n)
+    normalize(sign * n)
 }
 
 /// Removes `,` separators if they group the integer part in threes; otherwise refuses.
@@ -288,8 +321,50 @@ fn strip_thousands(s: &str) -> Option<String> {
     Some(groups.concat() + rest)
 }
 
+/// Splits `text` on `sep` into exactly `n` all-digit parts of at most `max` digits.
+fn digit_parts(text: &str, sep: char, n: usize, max: usize) -> Option<Vec<i64>> {
+    let parts: Vec<&str> = text.split(sep).collect();
+    if parts.len() != n {
+        return None;
+    }
+    parts
+        .iter()
+        .map(|p| {
+            let ok = !p.is_empty() && p.len() <= max && p.bytes().all(|b| b.is_ascii_digit());
+            ok.then(|| p.parse().ok()).flatten()
+        })
+        .collect()
+}
+
+/// `YYYY-MM-DD` (month and day may be one digit) or US `M/D/YYYY`.
+fn serial_from_date_text(s: &str) -> Option<f64> {
+    if let Some(p) = digit_parts(s, '-', 3, 4)
+        && s.len() >= 8
+        && s.find('-') == Some(4)
+    {
+        return serial_from_date(p[0], p[1], p[2]);
+    }
+    let p = digit_parts(s, '/', 3, 4)?;
+    if p[2] < 1000 {
+        return None;
+    }
+    serial_from_date(p[2], p[0], p[1])
+}
+
+/// `H:MM` or `H:MM:SS` on a 24-hour clock, as a fraction of a day.
+fn fraction_from_time(s: &str) -> Option<f64> {
+    let p = digit_parts(s, ':', 3, 2).or_else(|| digit_parts(s, ':', 2, 2))?;
+    let (h, m, sec) = (p[0], p[1], p.get(2).copied().unwrap_or(0));
+    if h > 23 || m > 59 || sec > 59 {
+        return None;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "under 86,400")]
+    let seconds = (h * 3600 + m * 60 + sec) as f64;
+    Some(seconds / 86_400.0)
+}
+
 /// Days from 1970-01-01 to a civil date (proleptic Gregorian). Howard Hinnant's
-/// `days_from_civil`.
+/// `days_from_civil`. Callers keep the year to 1900..=9999, so nothing overflows.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -321,34 +396,49 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 
 /// Excel's largest date, 9999-12-31.
 const MAX_SERIAL: i64 = 2_958_465;
+/// Excel's phantom 1900-02-29, kept for compatibility with Lotus 1-2-3.
+const PHANTOM_LEAP_DAY: i64 = 60;
+/// One past the last valid serial, for range checks on floats.
+const SERIAL_END: f64 = 2_958_466.0;
 
 /// The Excel serial for a calendar date, or `None` outside 1900-01-01..=9999-12-31.
+/// Excel's phantom 1900-02-29 is accepted as serial 60.
 #[must_use]
 pub fn serial_from_date(y: i64, m: i64, d: i64) -> Option<f64> {
-    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+    if !(1900..=9999).contains(&y) || !(1..=12).contains(&m) {
+        return None;
+    }
+    if (y, m, d) == (1900, 2, 29) {
+        #[expect(clippy::cast_precision_loss, reason = "a small constant")]
+        return Some(PHANTOM_LEAP_DAY as f64);
+    }
+    if d < 1 || d > days_in_month(y, m) {
         return None;
     }
     let days = days_from_civil(y, m, d) - days_from_civil(1899, 12, 31);
-    // Excel counts a 1900-02-29 that never existed (serial 60), so later dates are one
-    // higher than a true day count.
-    let serial = if days >= 60 { days + 1 } else { days };
+    // Excel counts the phantom day, so every later date is one higher than a true count.
+    let serial = if days >= PHANTOM_LEAP_DAY {
+        days + 1
+    } else {
+        days
+    };
     #[expect(clippy::cast_precision_loss, reason = "serials stay below 2^22")]
     (1..=MAX_SERIAL).contains(&serial).then_some(serial as f64)
 }
 
-/// The calendar date of an Excel serial's whole part, or `None` for serial 60 (the
-/// phantom 1900-02-29) and anything outside Excel's date range.
+/// The calendar date of an Excel serial's whole part, or `None` outside Excel's date
+/// range. Serial 60 is Excel's phantom 1900-02-29.
 #[must_use]
 pub fn date_from_serial(serial: f64) -> Option<(i64, i64, i64)> {
-    if !serial.is_finite() {
+    if !serial.is_finite() || !(1.0..SERIAL_END).contains(&serial) {
         return None;
     }
-    #[expect(clippy::cast_possible_truncation, reason = "range-checked below")]
+    #[expect(clippy::cast_possible_truncation, reason = "range-checked above")]
     let n = serial.floor() as i64;
-    if !(1..=MAX_SERIAL).contains(&n) || n == 60 {
-        return None;
+    if n == PHANTOM_LEAP_DAY {
+        return Some((1900, 2, 29));
     }
-    let days = if n > 60 { n - 1 } else { n };
+    let days = if n > PHANTOM_LEAP_DAY { n - 1 } else { n };
     Some(civil_from_days(days_from_civil(1899, 12, 31) + days))
 }
 
@@ -368,14 +458,7 @@ pub fn serial_from_iso(s: &str) -> Option<f64> {
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
         return None;
     }
-    let num = |r: std::ops::Range<usize>| -> Option<i64> {
-        let part = &s[r];
-        part.bytes()
-            .all(|c| c.is_ascii_digit())
-            .then(|| part.parse().ok())
-            .flatten()
-    };
-    serial_from_date(num(0..4)?, num(5..7)?, num(8..10)?)
+    serial_from_date_text(s)
 }
 
 /// An Excel serial as `YYYY-MM-DD`.
@@ -546,7 +629,7 @@ mod tests {
                 Number(-8.0),
                 Number(1.0 / 3.0),
                 Error(E::Num),
-                "docs: negative base, fractional power",
+                "unverified in Excel; recorded by 0024",
             ),
             (B::Pow, Number(-2.0), Number(2.0), Number(4.0), "docs"),
             (
@@ -603,13 +686,9 @@ mod tests {
         assert_eq!(binary(B::Add, &d, &d), Number(90644.0));
         assert_eq!(binary(B::Mul, &d, &Number(1.0)), Number(45322.0));
         assert_eq!(
-            binary(B::Add, &d, &Number(f64::MAX)),
-            Date(f64::MAX),
-            "still finite"
-        );
-        assert_eq!(
-            binary(B::Add, &Date(f64::MAX), &Number(f64::MAX)),
-            Error(E::Num)
+            binary(B::Add, &d, &Number(1e308)),
+            Error(E::Num),
+            "beyond Excel's range"
         );
     }
 
@@ -731,7 +810,12 @@ mod tests {
             assert_eq!(serial_from_iso(iso), Some(serial), "{iso}");
             assert_eq!(iso_from_serial(serial).as_deref(), Some(iso), "{serial}");
         }
-        assert_eq!(iso_from_serial(60.0), None, "the phantom 1900-02-29");
+        assert_eq!(
+            iso_from_serial(60.0).as_deref(),
+            Some("1900-02-29"),
+            "the phantom leap day"
+        );
+        assert_eq!(serial_from_iso("1900-02-29"), Some(60.0));
         assert_eq!(
             iso_from_serial(45292.75).as_deref(),
             Some("2024-01-01"),
@@ -752,6 +836,87 @@ mod tests {
             let s = f64::from(serial);
             assert_eq!(serial_from_iso(&iso_from_serial(s).unwrap()), Some(s));
         }
+    }
+
+    #[test]
+    fn general_keeps_fifteen_digits_at_every_magnitude() {
+        let cases = [
+            (99_999_999_999_999.9, "99999999999999.9"),
+            (99_999.999_999_999_9, "99999.9999999999"),
+            (9_999_999.999_999_99, "9999999.99999999"),
+            (9.999_999_999_999_99e-9, "0.00000000999999999999999"),
+            (1.5e-10, "1.5E-10"),
+            (0.1, "0.1"),
+            (1.0 / 3.0, "0.333333333333333"),
+            (1e14, "100000000000000"),
+            (-123.45, "-123.45"),
+            (1e-9, "0.000000001"),
+            (9.999_999_999_999_99e307, "9.99999999999999E+307"),
+        ];
+        for (n, want) in cases {
+            assert_eq!(general(n), want, "{n:e}");
+        }
+        assert_eq!(general(f64::NAN), "#NUM!");
+    }
+
+    #[test]
+    fn dates_and_times_in_text_become_numbers() {
+        assert_eq!(number_from_text("6/1/2001"), serial_from_iso("2001-06-01"));
+        assert_eq!(
+            binary(B::Sub, &text("6/1/2001"), &text("5/1/2001")),
+            Number(31.0),
+            "Microsoft's operators documentation example"
+        );
+        assert_eq!(number_from_text("2024-1-31"), Some(45322.0));
+        assert_eq!(number_from_text("12:00"), Some(0.5));
+        assert_eq!(number_from_text("06:00:00"), Some(0.25));
+        for bad in [
+            "24:00",
+            "12:60",
+            "1/2",
+            "13/1/2024",
+            "2024-02-30",
+            "(-5)",
+            "(+5)",
+            "$-5x",
+        ] {
+            assert_eq!(number_from_text(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn edge_numbers() {
+        assert_eq!(
+            Value::number(f64::MAX),
+            Error(E::Num),
+            "beyond 9.99999999999999E+307"
+        );
+        assert_eq!(
+            Value::number(1e-310),
+            Number(0.0),
+            "subnormals flush to zero"
+        );
+        assert_eq!(compare(&Number(-0.0), &Number(0.0)), Ok(Ordering::Equal));
+        assert_eq!(binary(B::Eq, &Number(-0.0), &Empty), Bool(true));
+        for (y, m, d) in [
+            (i64::MAX, 1, 1),
+            (i64::MIN, 2, 1),
+            (1899, 12, 31),
+            (10_000, 1, 1),
+        ] {
+            assert_eq!(serial_from_date(y, m, d), None, "{y}-{m}-{d}");
+        }
+        for s in [f64::NAN, f64::INFINITY, -1.0, 0.5, 3e6] {
+            assert_eq!(date_from_serial(s), None, "{s}");
+        }
+    }
+
+    #[test]
+    fn punctuation_sorts_before_digits_before_letters() {
+        assert_eq!(compare(&text("~"), &text("a")), Ok(Ordering::Less));
+        assert_eq!(compare(&text("9"), &text("a")), Ok(Ordering::Less));
+        assert_eq!(compare(&text("_x"), &text("1")), Ok(Ordering::Less));
+        assert_eq!(compare(&text("Apple"), &text("apple")), Ok(Ordering::Equal));
     }
 
     #[test]
