@@ -225,15 +225,28 @@ cmd_ship() {
     branch=$(current_branch)
     [ -z "$(git -C "$ROOT" status --porcelain)" ] || die "uncommitted changes in $ROOT; commit them first"
 
-    if [ "$(pr_state "$branch")" = "OPEN" ]; then
-        cmd_check
-        say "pushing $branch"
-        git -C "$ROOT" push --quiet --force-with-lease -u origin "$branch"
-    elif [ -n "$body_file" ]; then
-        cmd_pr --body-file "$body_file"
-    else
-        cmd_pr
-    fi
+    case "$(pr_state "$branch")" in
+        OPEN)
+            cmd_check
+            say "pushing $branch"
+            git -C "$ROOT" push --quiet --force-with-lease -u origin "$branch"
+            ;;
+        # Auto-merge can land the PR after an earlier ship gave up; opening another
+        # PR for the same commits would duplicate it.
+        MERGED)
+            say "pull request for $branch already merged"
+            cmd_done
+            return
+            ;;
+        CLOSED) die "the pull request for $branch was closed; reopen it or start a new branch" ;;
+        *)
+            if [ -n "$body_file" ]; then
+                cmd_pr --body-file "$body_file"
+            else
+                cmd_pr
+            fi
+            ;;
+    esac
     say "enabling auto-merge (squash)"
     (cd "$ROOT" && gh pr merge "$branch" --auto --squash)
 
