@@ -285,10 +285,12 @@ impl Workbook {
         !self.history.redo.is_empty()
     }
 
-    /// Applies the top entry of one stack and moves its inverse to the other. If the
-    /// entry cannot be applied (another tool changed the file underneath it), the file is
-    /// left as it was, the entry is dropped so it cannot block the rest of history, and
-    /// the error is returned.
+    /// Applies the top entry of one stack and moves its inverse to the other.
+    ///
+    /// If the entry cannot apply because another tool changed the file underneath it (a
+    /// row or column it needs is gone), the file is left as it was, the entry is dropped
+    /// so it cannot block the rest of history, and the error is returned. Any other error
+    /// (a locked file, a full disk) leaves the entry in place to try again.
     fn replay(&mut self, undo: bool) -> Result<bool> {
         let session = self.history.session;
         let (from, to) = if undo {
@@ -296,26 +298,30 @@ impl Workbook {
         } else {
             (&mut self.history.redo, &mut self.history.undo)
         };
-        let Some(entry) = from.pop() else {
+        let Some(entry) = from.last() else {
             return Ok(false);
         };
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let applied = entry
+        if let Err(e) = entry
             .iter()
-            .try_for_each(|change| apply(&tx, change, session));
-        if let Err(e) = applied {
+            .try_for_each(|change| apply(&tx, change, session))
+        {
             drop(tx);
-            // The entry is gone, so its trash is no longer needed. If dropping it fails
-            // too, close() drops every table with this session's prefix anyway, and the
-            // original error is the one worth reporting.
-            for change in &entry {
-                let _ = release(&self.conn, change, session);
+            if changed_outside(&e) {
+                let entry = from.pop().expect("checked above");
+                // The entry is gone, so its trash is no longer needed. If dropping it fails
+                // too, close() drops every table with this session's prefix anyway, and
+                // the original error is the one worth reporting.
+                for change in &entry {
+                    let _ = release(&self.conn, change, session);
+                }
             }
             return Err(e);
         }
         tx.commit()?;
+        let entry = from.pop().expect("checked above");
         to.push(invert(entry));
         Ok(true)
     }
@@ -376,10 +382,21 @@ fn named(names: &HashMap<ColumnId, String>, id: ColumnId) -> Result<&str> {
 
 /// A row an undo or redo expected to find is gone: another tool changed the table.
 fn vanished(table: TableId, row: i64) -> Error {
-    Error::Corrupt(format!(
-        "row {row} of table {} changed outside xel",
-        table.0
-    ))
+    Error::ChangedOutside(format!("row {row} of table {} is gone", table.0))
+}
+
+/// Whether an error from applying a change means the file no longer matches what history
+/// recorded, as opposed to a passing problem such as a locked file.
+fn changed_outside(e: &Error) -> bool {
+    match e {
+        Error::ChangedOutside(_) | Error::NoSuchTable(_) | Error::NoSuchColumn(_) => true,
+        // A missing table or column (generic SQLITE_ERROR) or a clashing id.
+        Error::Sqlite(e) => matches!(
+            e.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::Unknown | rusqlite::ErrorCode::ConstraintViolation)
+        ),
+        _ => false,
+    }
 }
 
 fn insert_column_metadata(conn: &Connection, table: TableId, spec: &ColumnSpec) -> Result<()> {
@@ -852,7 +869,7 @@ mod tests {
             .unwrap()
             .execute("DELETE FROM T", [])
             .unwrap();
-        assert!(matches!(book.undo(), Err(Error::Corrupt(_))));
+        assert!(matches!(book.undo(), Err(Error::ChangedOutside(_))));
         assert!(book.can_undo(), "earlier edits are still undoable");
         assert!(
             book.undo().is_err(),
@@ -860,6 +877,21 @@ mod tests {
         );
         assert!(book.undo().unwrap(), "undoing create_table still works");
         assert!(book.tables().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_locked_file_keeps_the_undo_entry_for_another_try() {
+        let dir = TempDir::new();
+        let (mut book, path) = book(&dir);
+        let t = book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        book.delete_table(t).unwrap();
+        book.conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(book.undo().is_err(), "the file is locked");
+        other.execute_batch("COMMIT").unwrap();
+        assert!(book.undo().unwrap(), "the entry was kept and now applies");
+        assert_eq!(book.table(t).unwrap().name, "T");
     }
 
     #[test]

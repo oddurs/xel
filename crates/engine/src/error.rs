@@ -57,6 +57,9 @@ pub enum Error {
     NotFinite { column: String },
     #[error("{value:?} is not one of the options in column {column:?}")]
     NotAnOption { column: String, value: String },
+    /// Another tool changed the file in a way an undo or redo cannot reconcile.
+    #[error("the workbook was changed outside xel: {0}")]
+    ChangedOutside(String),
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
