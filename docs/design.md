@@ -162,18 +162,16 @@ for behavior and makes the engine testable without UI.
   format version.
 - History is an append-only `xel_changes` log, compactable into snapshots.
 
-## First release
+## Releases
 
-**v0.1: the file is a database.** Create, open, and save `.xel`; typed tables in a
-native grid; Excel-style formulas (the 80 most used functions) with incremental
-recalc; linked records with lookups; SQL query blocks; CSV and `.xlsx` import; the
-`xel` Python package for reading and writing tables.
+The plan lives in cairn and is rendered to `ROADMAP.md`. In short: v0.1 ships typed
+tables with formula columns, saved as SQLite. v0.2 adds linked records, SQL query
+blocks, calc blocks, and views. v0.3 is the Excel bridge, with pivot tables. v0.4 adds
+Python blocks, the Python package, and charts. v1.0 adds no features; it stabilizes the
+file format and API.
 
-**v0.2: views and the Excel bridge.** Filter, sort, and group views; kanban and form
-views; `.xlsx` export with its report; Python blocks; history and version compare.
-
-**Later.** Pivot tables, charts, sources with refresh, Quick Look and Spotlight, App
-Intents, the MCP server.
+**In 1.0:** pivot tables and charts. **Not in 1.0:** real-time collaboration,
+platforms other than macOS, and the Mac App Store.
 
 ## Open questions
 
@@ -185,5 +183,5 @@ Intents, the MCP server.
   to diff. Prototype both before committing.
 - **Trust.** Opening a workbook can run Python. It needs a trust prompt like Excel's
   "Enable Content", plus a sandboxed default.
-- **Collaboration.** Out of scope for now. SQLite plus a change log leaves room for
+- **Collaboration.** Out of scope for 1.0. SQLite plus a change log leaves room for
   sync later.
