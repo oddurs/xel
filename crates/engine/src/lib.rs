@@ -4,15 +4,19 @@
 // `# Errors` section on each function would repeat it.
 #![allow(clippy::missing_errors_doc)]
 
+mod cell;
 mod cell_ref;
 mod error;
 pub mod formula;
+mod rows;
 mod schema;
 #[cfg(test)]
 mod test_support;
 mod workbook;
 
+pub use cell::{CellValue, Date};
 pub use cell_ref::{CellRef, ParseCellRefError};
 pub use error::{Error, Result};
+pub use rows::{Row, RowId};
 pub use schema::{Column, ColumnId, ColumnType, Table, TableId};
 pub use workbook::{FORMAT_VERSION, Workbook};
