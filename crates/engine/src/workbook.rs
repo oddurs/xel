@@ -131,6 +131,10 @@ impl Workbook {
 
     fn configure(conn: Connection, format_version: u32) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", true)?;
+        // SQLite treats an unknown "name" as a string literal. A column dropped by another
+        // tool would then read back as its own name in every row; make it an error.
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML, false)?;
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
         // Another reader (sqlite3, a Python script) may briefly hold the file; wait for it
         // rather than failing the user's edit.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;

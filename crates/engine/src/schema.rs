@@ -95,8 +95,11 @@ impl ColumnType {
             Self::Number => format!("{quoted} REAL"),
             Self::Checkbox => format!("{quoted} INTEGER CHECK ({quoted} IN (0, 1))"),
             Self::Date => format!(
+                // `IS`, not `=`: date() is NULL for nonsense like 2024-00-01, and a CHECK
+                // that evaluates to NULL passes.
                 "{quoted} TEXT CHECK ({quoted} GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]' \
-                 AND date({quoted}) = {quoted})"
+                 AND date({quoted}) IS {quoted} \
+                 AND {quoted} BETWEEN '1900-01-01' AND '9999-12-31')"
             ),
         }
     }
@@ -156,7 +159,9 @@ impl Workbook {
         ensure_table_name_free(&tx, name)?;
         let defs: Vec<String> = columns.iter().map(|(c, ty)| ty.sql(&quote(c))).collect();
         tx.execute_batch(&format!(
-            "CREATE TABLE {} ({} INTEGER PRIMARY KEY, {}) STRICT;",
+            // AUTOINCREMENT: a deleted row's id is never handed out again, so an id held
+            // by undo, a selection, or a script cannot silently point at another row.
+            "CREATE TABLE {} ({} INTEGER PRIMARY KEY AUTOINCREMENT, {}) STRICT;",
             quote(name),
             quote(ROW_ID),
             defs.join(", ")

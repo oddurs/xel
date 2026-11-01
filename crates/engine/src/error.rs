@@ -53,6 +53,8 @@ pub enum Error {
         expected: ColumnType,
         found: &'static str,
     },
+    #[error("column {column:?} cannot hold infinity or a value that is not a number")]
+    NotFinite { column: String },
     #[error("{value:?} is not one of the options in column {column:?}")]
     NotAnOption { column: String, value: String },
     #[error("database error: {0}")]

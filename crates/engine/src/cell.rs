@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::formula::{date_from_serial, serial_from_date};
+use crate::formula::{date_from_serial, serial_from_date, serial_from_iso};
 
 /// A real calendar date within Excel's range, 1900-01-01 to 9999-12-31, so every stored
 /// date has an Excel serial for formulas. Excel's phantom 1900-02-29 is not a date a
@@ -39,22 +39,7 @@ impl Date {
     /// Parses `YYYY-MM-DD`, the form date columns store.
     #[must_use]
     pub fn from_iso(s: &str) -> Option<Self> {
-        let b = s.as_bytes();
-        if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
-            return None;
-        }
-        let digits = |r: std::ops::Range<usize>| {
-            let part = &s[r];
-            part.bytes()
-                .all(|c| c.is_ascii_digit())
-                .then(|| part.parse().ok())
-                .flatten()
-        };
-        Self::new(
-            digits(0..4)?,
-            u8::try_from(digits(5..7)?).ok()?,
-            u8::try_from(digits(8..10)?).ok()?,
-        )
+        serial_from_iso(s).and_then(Self::from_serial)
     }
 
     /// The date of an Excel serial's whole part.

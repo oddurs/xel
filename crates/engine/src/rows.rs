@@ -1,18 +1,30 @@
 //! Rows: inserting, editing, deleting, and reading windows of a table in display order.
 //! Display order is row id order for now; views add sorting in v0.2.
 
+use std::collections::BTreeSet;
+
 use rusqlite::types::{Value as SqlValue, ValueRef};
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::{ErrorCode, params_from_iter};
 
 use crate::cell::{CellValue, Date};
 use crate::error::{Error, Result};
 use crate::schema::{Column, ColumnId, ColumnType, ROW_ID, Table, TableId, quote};
 use crate::workbook::Workbook;
 
-/// A row's identity within its table. Stable across edits, deletes of other rows, and
-/// VACUUM.
+/// A row's identity: its table and its id there. Ids are never reused, so a `RowId`
+/// held across edits either finds its row or reports it gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RowId(pub(crate) i64);
+pub struct RowId {
+    pub(crate) table: TableId,
+    pub(crate) id: i64,
+}
+
+impl RowId {
+    #[must_use]
+    pub fn table(self) -> TableId {
+        self.table
+    }
+}
 
 /// One row's cells, in the table's column order.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,11 +36,14 @@ pub struct Row {
 impl Workbook {
     pub fn row_count(&self, table: TableId) -> Result<u64> {
         let t = self.table(table)?;
-        let n: i64 = self.conn.query_row(
-            &format!("SELECT count(*) FROM {}", quote(&t.name)),
-            [],
-            |r| r.get(0),
-        )?;
+        let n: i64 = self
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM {}", quote(&t.name)),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| out_of_sync(&t, e))?;
         Ok(n.unsigned_abs())
     }
 
@@ -37,14 +52,16 @@ impl Workbook {
         let t = self.table(table)?;
         let cols: Vec<String> = t.columns.iter().map(|c| quote(&c.name)).collect();
         let sql = format!(
-            "SELECT {}, {} FROM {} ORDER BY {} LIMIT ?1 OFFSET ?2",
-            quote(ROW_ID),
+            "SELECT {id}, {} FROM {} ORDER BY {id} LIMIT ?1 OFFSET ?2",
             cols.join(", "),
             quote(&t.name),
-            quote(ROW_ID)
+            id = quote(ROW_ID),
         );
         let clamp = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(&sql)
+            .map_err(|e| out_of_sync(&t, e))?;
         let mut rows = stmt.query([clamp(limit), clamp(offset)])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -55,14 +72,18 @@ impl Workbook {
                 .map(|(i, col)| read_cell(col, r.get_ref(i + 1)?))
                 .collect::<Result<_>>()?;
             out.push(Row {
-                id: RowId(r.get(0)?),
+                id: RowId {
+                    table,
+                    id: r.get(0)?,
+                },
                 cells,
             });
         }
         Ok(out)
     }
 
-    /// Appends a row. Columns not listed are left empty.
+    /// Appends a row. Columns not listed are left empty; a column listed twice is an
+    /// error rather than a silent choice between the two values.
     pub fn insert_row(
         &mut self,
         table: TableId,
@@ -71,12 +92,15 @@ impl Workbook {
         let t = self.table(table)?;
         let mut names = Vec::with_capacity(values.len());
         let mut params = Vec::with_capacity(values.len());
+        let mut seen = BTreeSet::new();
         for (id, value) in values {
             let col = column_of(&t, *id)?;
+            if !seen.insert(*id) {
+                return Err(Error::DuplicateName(col.name.clone()));
+            }
             params.push(stored(col, value)?);
             names.push(quote(&col.name));
         }
-        let tx = self.write()?;
         let sql = if names.is_empty() {
             format!("INSERT INTO {} DEFAULT VALUES", quote(&t.name))
         } else {
@@ -87,72 +111,91 @@ impl Workbook {
                 names.join(", ")
             )
         };
-        tx.execute(&sql, params_from_iter(params))?;
+        let tx = self.write()?;
+        tx.execute(&sql, params_from_iter(params))
+            .map_err(|e| out_of_sync(&t, e))?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
-        Ok(RowId(id))
+        Ok(RowId { table, id })
     }
 
     /// Sets one cell. The value must fit the column's type.
     pub fn set_cell(&mut self, column: ColumnId, row: RowId, value: &CellValue) -> Result<()> {
-        let (t, col) = self.table_of_column(column)?;
-        let stored = stored(&col, value)?;
+        self.set_cells(row.table, &[(column, row, value.clone())])
+    }
+
+    /// Sets many cells of one table in one transaction, as a paste does. Every value is
+    /// checked before anything is written; any failure writes nothing.
+    pub fn set_cells(
+        &mut self,
+        table: TableId,
+        cells: &[(ColumnId, RowId, CellValue)],
+    ) -> Result<()> {
+        let t = self.table(table)?;
+        let mut writes = Vec::with_capacity(cells.len());
+        for (column, row, value) in cells {
+            let col = column_of(&t, *column)?;
+            if row.table != table {
+                return Err(Error::NoSuchRow(*row));
+            }
+            writes.push((quote(&col.name), row.id, stored(col, value)?));
+        }
         let tx = self.write()?;
-        let changed = tx.execute(
-            &format!(
-                "UPDATE {} SET {} = ?1 WHERE {} = ?2",
+        for (col, id, value) in writes {
+            let sql = format!(
+                "UPDATE {} SET {col} = ?1 WHERE {} = ?2",
                 quote(&t.name),
-                quote(&col.name),
                 quote(ROW_ID)
-            ),
-            rusqlite::params![stored, row.0],
-        )?;
-        if changed == 0 {
-            return Err(Error::NoSuchRow(row));
+            );
+            let mut stmt = tx.prepare_cached(&sql).map_err(|e| out_of_sync(&t, e))?;
+            if stmt.execute(rusqlite::params![value, id])? == 0 {
+                return Err(Error::NoSuchRow(RowId { table, id }));
+            }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Deletes rows. Fails without deleting anything if any of them does not exist.
+    /// Deletes rows. Naming a row twice is fine; naming a missing row deletes nothing.
     pub fn delete_rows(&mut self, table: TableId, rows: &[RowId]) -> Result<()> {
         let t = self.table(table)?;
+        let unique: BTreeSet<RowId> = rows.iter().copied().collect();
         let tx = self.write()?;
-        delete_each(&tx, &t, rows)?;
+        {
+            let sql = format!(
+                "DELETE FROM {} WHERE {} = ?1",
+                quote(&t.name),
+                quote(ROW_ID)
+            );
+            let mut stmt = tx.prepare(&sql).map_err(|e| out_of_sync(&t, e))?;
+            for row in unique {
+                if row.table != table || stmt.execute([row.id])? == 0 {
+                    return Err(Error::NoSuchRow(row));
+                }
+            }
+        }
         tx.commit()?;
         Ok(())
-    }
-
-    fn table_of_column(&self, column: ColumnId) -> Result<(Table, Column)> {
-        let table: i64 = self
-            .conn
-            .query_row(
-                "SELECT table_id FROM xel_columns WHERE id = ?1",
-                [column.0],
-                |r| r.get(0),
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Error::NoSuchColumn(column),
-                e => e.into(),
-            })?;
-        let t = self.table(TableId(table))?;
-        let col = column_of(&t, column)?.clone();
-        Ok((t, col))
     }
 }
 
-fn delete_each(conn: &Connection, t: &Table, rows: &[RowId]) -> Result<()> {
-    let mut stmt = conn.prepare(&format!(
-        "DELETE FROM {} WHERE {} = ?1",
-        quote(&t.name),
-        quote(ROW_ID)
-    ))?;
-    for row in rows {
-        if stmt.execute([row.0])? == 0 {
-            return Err(Error::NoSuchRow(*row));
+/// The SQL for row operations is generated from xel's metadata, so SQLite rejecting it
+/// (no such table or column) means another tool changed the table behind xel's back.
+fn out_of_sync(t: &Table, e: rusqlite::Error) -> Error {
+    let generic = match &e {
+        rusqlite::Error::SqliteFailure(f, _) | rusqlite::Error::SqlInputError { error: f, .. } => {
+            f.code == ErrorCode::Unknown
         }
+        _ => false,
+    };
+    if generic {
+        Error::Corrupt(format!(
+            "table {:?} no longer matches its metadata: {e}",
+            t.name
+        ))
+    } else {
+        e.into()
     }
-    Ok(())
 }
 
 fn column_of(t: &Table, id: ColumnId) -> Result<&Column> {
@@ -172,7 +215,12 @@ fn stored(col: &Column, value: &CellValue) -> Result<SqlValue> {
     Ok(match (col.ty, value) {
         (_, CellValue::Empty) => SqlValue::Null,
         (ColumnType::Text, CellValue::Text(s)) => SqlValue::Text(s.clone()),
-        (ColumnType::Number, CellValue::Number(n)) if n.is_finite() => {
+        (ColumnType::Number, CellValue::Number(n)) if !n.is_finite() => {
+            return Err(Error::NotFinite {
+                column: col.name.clone(),
+            });
+        }
+        (ColumnType::Number, CellValue::Number(n)) => {
             SqlValue::Real(if *n == 0.0 { 0.0 } else { *n })
         }
         (ColumnType::Checkbox, CellValue::Checkbox(b)) => SqlValue::Integer(i64::from(*b)),
@@ -207,7 +255,7 @@ fn read_cell(col: &Column, raw: ValueRef<'_>) -> Result<CellValue> {
         (ColumnType::Text | ColumnType::Select, ValueRef::Text(t)) => {
             CellValue::Text(String::from_utf8_lossy(t).into_owned())
         }
-        (ColumnType::Number, ValueRef::Real(n)) => CellValue::Number(n),
+        (ColumnType::Number, ValueRef::Real(n)) if n.is_finite() => CellValue::Number(n),
         (ColumnType::Checkbox, ValueRef::Integer(i)) => CellValue::Checkbox(i != 0),
         (ColumnType::Date, ValueRef::Text(t)) => CellValue::Date(
             std::str::from_utf8(t)
@@ -309,7 +357,7 @@ mod tests {
         let stored: (String, f64, i64, String, String) = raw
             .query_row(
                 "SELECT Name, Amount, Paid, Due, Status FROM T WHERE _id = ?1",
-                [id.0],
+                [id.id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
@@ -333,7 +381,7 @@ mod tests {
         assert!(matches!(
             f.book
                 .set_cell(f.cols[1], row, &CellValue::Number(f64::NAN)),
-            Err(Error::TypeMismatch { .. })
+            Err(Error::NotFinite { .. })
         ));
         assert!(matches!(
             f.book.set_cell(f.cols[4], row, &text("Maybe")),
@@ -369,7 +417,14 @@ mod tests {
             CellValue::Empty
         );
         assert!(matches!(
-            f.book.set_cell(f.cols[0], RowId(999), &text("x")),
+            f.book.set_cell(
+                f.cols[0],
+                RowId {
+                    table: f.table,
+                    id: 999
+                },
+                &text("x")
+            ),
             Err(Error::NoSuchRow(_))
         ));
     }
@@ -408,6 +463,118 @@ mod tests {
         // New rows go after the existing ones even after deletes.
         let new = f.book.insert_row(f.table, &[]).unwrap();
         assert_eq!(f.book.rows(f.table, 7, 1).unwrap()[0].id, new);
+    }
+
+    #[test]
+    fn deleted_ids_are_never_reused() {
+        let mut f = fixture();
+        let a = f.book.insert_row(f.table, &[]).unwrap();
+        let b = f.book.insert_row(f.table, &[]).unwrap();
+        f.book.delete_rows(f.table, &[b]).unwrap();
+        let c = f.book.insert_row(f.table, &[]).unwrap();
+        assert!(c.id > b.id, "{c:?} reused {b:?}");
+        assert!(matches!(
+            f.book.set_cell(f.cols[0], b, &text("x")),
+            Err(Error::NoSuchRow(_))
+        ));
+        // Naming a row twice is fine.
+        f.book.delete_rows(f.table, &[a, a, c]).unwrap();
+        assert_eq!(f.book.row_count(f.table).unwrap(), 0);
+    }
+
+    #[test]
+    fn rows_and_columns_from_other_tables_are_refused() {
+        let mut f = fixture();
+        let other = f
+            .book
+            .create_table("U", &[("x", ColumnType::Text)])
+            .unwrap();
+        let other_row = f.book.insert_row(other, &[]).unwrap();
+        let mine = f.book.insert_row(f.table, &[]).unwrap();
+        assert_eq!(
+            other_row.id, mine.id,
+            "ids are per table, so they can coincide"
+        );
+        assert!(matches!(
+            f.book.set_cell(f.cols[0], other_row, &text("x")),
+            Err(Error::NoSuchColumn(_) | Error::NoSuchRow(_))
+        ));
+        assert!(matches!(
+            f.book.delete_rows(f.table, &[other_row]),
+            Err(Error::NoSuchRow(_))
+        ));
+        assert_eq!(
+            f.book.rows(f.table, 0, 1).unwrap()[0].cells[0],
+            CellValue::Empty
+        );
+    }
+
+    #[test]
+    fn a_column_listed_twice_in_an_insert_is_an_error() {
+        let mut f = fixture();
+        let err = f
+            .book
+            .insert_row(f.table, &[(f.cols[0], text("a")), (f.cols[0], text("b"))]);
+        assert!(matches!(err, Err(Error::DuplicateName(_))));
+        assert_eq!(f.book.row_count(f.table).unwrap(), 0);
+    }
+
+    #[test]
+    fn set_cells_writes_all_or_nothing() {
+        let mut f = fixture();
+        let a = f.book.insert_row(f.table, &[]).unwrap();
+        let b = f.book.insert_row(f.table, &[]).unwrap();
+        f.book
+            .set_cells(
+                f.table,
+                &[
+                    (f.cols[0], a, text("A")),
+                    (f.cols[1], b, CellValue::Number(2.0)),
+                ],
+            )
+            .unwrap();
+        let bad = f.book.set_cells(
+            f.table,
+            &[
+                (f.cols[0], a, text("changed")),
+                (f.cols[1], b, text("not a number")),
+            ],
+        );
+        assert!(matches!(bad, Err(Error::TypeMismatch { .. })));
+        let rows = f.book.rows(f.table, 0, 2).unwrap();
+        assert_eq!(
+            (&rows[0].cells[0], &rows[1].cells[1]),
+            (&text("A"), &CellValue::Number(2.0))
+        );
+    }
+
+    #[test]
+    fn outside_changes_are_errors_not_garbage() {
+        let mut f = fixture();
+        f.book
+            .insert_row(f.table, &[(f.cols[0], text("keep"))])
+            .unwrap();
+        let raw = Connection::open(&f.path).unwrap();
+        // The date CHECK refuses what xel could not read back.
+        for bad in ["2024-00-01", "2024-01-39", "1850-01-01", "1900-02-29"] {
+            assert!(
+                raw.execute("INSERT INTO T (Due) VALUES (?1)", [bad])
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        raw.execute_batch("ALTER TABLE T DROP COLUMN Status")
+            .unwrap();
+        drop(raw);
+        let err = f.book.rows(f.table, 0, 10).unwrap_err();
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "a dropped column must not read as its name: {err:?}"
+        );
+        assert!(matches!(
+            f.book.insert_row(f.table, &[(f.cols[4], text("Open"))]),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     #[test]
