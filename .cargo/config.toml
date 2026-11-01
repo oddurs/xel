@@ -1,0 +1,4 @@
+[env]
+# The app's minimum macOS. C code built by build scripts (bundled SQLite) must target it
+# too, or linking the engine into the app warns that objects need a newer macOS.
+MACOSX_DEPLOYMENT_TARGET = "26.0"

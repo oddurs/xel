@@ -6,6 +6,21 @@ cd "$(dirname "$0")/.."
 
 SWIFT_SOURCES="app/Package.swift app/Sources"
 
+# Generates the Swift bindings for the engine from the built static library. SwiftPM
+# needs them laid out as a C module (header and module map) and a Swift target.
+bindings() {
+    out=app/Generated
+    tmp=$out/.uniffi
+    rm -rf "$out"
+    mkdir -p "$tmp" "$out/xel_ffiFFI" "$out/XelEngine"
+    cargo run --quiet --locked -p uniffi-bindgen -- generate \
+        --library target/debug/libxel_ffi.a --language swift --out-dir "$tmp"
+    mv "$tmp/xel_ffiFFI.h" "$out/xel_ffiFFI/"
+    mv "$tmp/xel_ffiFFI.modulemap" "$out/xel_ffiFFI/module.modulemap"
+    mv "$tmp/xel_ffi.swift" "$out/XelEngine/"
+    rm -rf "$tmp"
+}
+
 swift_fmt_check() {
     # swift-format has no --check mode; diff each file against its formatted output.
     drift=0
@@ -39,6 +54,7 @@ run() {
             ;;
         build)
             cargo build --workspace --locked
+            bindings
             swift build --package-path app -Xswiftc -warnings-as-errors
             ;;
         check)

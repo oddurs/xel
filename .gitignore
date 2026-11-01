@@ -4,6 +4,7 @@
 # Swift
 /app/.build/
 /app/.swiftpm/
+/app/Generated/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 DerivedData/
