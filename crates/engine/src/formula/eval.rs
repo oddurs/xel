@@ -168,50 +168,19 @@ pub struct Function {
     pub eval: for<'a> fn(&Args<'a>) -> Arg<'a>,
 }
 
-/// Every built-in function, sorted by name. Function families add themselves here.
-static FUNCTIONS: &[Function] = &[
-    Function {
-        name: "FALSE",
-        min_args: 0,
-        max_args: Some(0),
-        volatile: false,
-        signature: "FALSE()",
-        description: "Returns the logical value FALSE.",
-        eval: |_| Arg::Value(Value::Bool(false)),
-    },
-    Function {
-        name: "NA",
-        min_args: 0,
-        max_args: Some(0),
-        volatile: false,
-        signature: "NA()",
-        description: "Returns the error value #N/A.",
-        eval: |_| Arg::Value(Value::Error(ErrorKind::NA)),
-    },
-    Function {
-        name: "TRUE",
-        min_args: 0,
-        max_args: Some(0),
-        volatile: false,
-        signature: "TRUE()",
-        description: "Returns the logical value TRUE.",
-        eval: |_| Arg::Value(Value::Bool(true)),
-    },
-];
-
 /// All built-in functions, sorted by name.
 #[must_use]
 pub fn functions() -> &'static [Function] {
-    FUNCTIONS
+    super::functions::FUNCTIONS
 }
 
 /// Looks up a built-in function by its upper-case name.
 #[must_use]
 pub fn function(name: &str) -> Option<&'static Function> {
-    FUNCTIONS
-        .binary_search_by(|f| f.name.cmp(name))
+    let all = functions();
+    all.binary_search_by(|f| f.name.cmp(name))
         .ok()
-        .map(|i| &FUNCTIONS[i])
+        .map(|i| &all[i])
 }
 
 /// Evaluates a formula to the single value a cell shows. An empty result shows as 0,
@@ -226,7 +195,7 @@ pub fn evaluate(expr: &Expr, ctx: &dyn Context) -> Value {
 
 /// One value from an argument. A 1×1 range is its value; a larger one where one value
 /// is wanted is `#VALUE!` (Excel would spill or intersect; neither applies to a table cell).
-fn scalar(arg: Arg<'_>) -> Value {
+pub(crate) fn scalar(arg: Arg<'_>) -> Value {
     match arg {
         Arg::Value(v) | Arg::Ref(v) => v,
         Arg::Range(r) if r.rows == 1 && r.cols == 1 => r.values[0].clone(),
@@ -312,21 +281,37 @@ fn map(arg: Arg<'_>, f: impl Fn(&Value) -> Value) -> Arg<'_> {
     }
 }
 
-/// A binary operator, element by element when either side is a range. Shapes broadcast
-/// as in Excel: a single value or a single row or column stretches to fit; cells beyond
-/// a smaller range are `#N/A`; an empty range gives an empty result.
+/// A binary operator, element by element when either side is a range.
 fn apply_binary<'a>(op: BinaryOp, a: Arg<'a>, b: Arg<'a>) -> Arg<'a> {
-    let as_range = |arg: Arg<'a>| match arg {
-        Arg::Range(r) => r,
-        Arg::Value(v) | Arg::Ref(v) => Range::single(v),
-    };
     if !matches!(a, Arg::Range(_)) && !matches!(b, Arg::Range(_)) {
         return Arg::Value(binary(op, &scalar(a), &scalar(b)));
     }
-    let (a, b) = (as_range(a), as_range(b));
-    let span = |x: usize, y: usize| if x == 0 || y == 0 { 0 } else { x.max(y) };
-    let rows = span(a.rows, b.rows);
-    let cols = span(a.cols, b.cols);
+    Arg::Range(broadcast(&[as_range(a), as_range(b)], |v| {
+        binary(op, &v[0], &v[1])
+    }))
+}
+
+/// Any argument as a range; a single value is a 1×1 range.
+pub(crate) fn as_range(arg: Arg<'_>) -> Range<'_> {
+    match arg {
+        Arg::Range(r) => r,
+        Arg::Value(v) | Arg::Ref(v) => Range::single(v),
+    }
+}
+
+/// Combines ranges element by element. Shapes broadcast as in Excel: a single value or a
+/// single row or column stretches to fit; cells beyond a smaller range are `#N/A`; an
+/// empty range gives an empty result.
+pub(crate) fn broadcast(ranges: &[Range<'_>], f: impl Fn(&[Value]) -> Value) -> Range<'static> {
+    let span = |dim: fn(&Range<'_>) -> usize| {
+        if ranges.iter().any(|r| dim(r) == 0) {
+            0
+        } else {
+            ranges.iter().map(dim).max().unwrap_or(0)
+        }
+    };
+    let rows = span(|r| r.rows);
+    let cols = span(|r| r.cols);
     let pick = |r: &Range<'_>, row: usize, col: usize| {
         let row = if r.rows == 1 { 0 } else { row };
         let col = if r.cols == 1 { 0 } else { col };
@@ -335,16 +320,19 @@ fn apply_binary<'a>(op: BinaryOp, a: Arg<'a>, b: Arg<'a>) -> Arg<'a> {
             .unwrap_or(Value::Error(ErrorKind::NA))
     };
     let mut values = Vec::with_capacity(rows * cols);
+    let mut cell = Vec::with_capacity(ranges.len());
     for row in 0..rows {
         for col in 0..cols {
-            values.push(binary(op, &pick(&a, row, col), &pick(&b, row, col)));
+            cell.clear();
+            cell.extend(ranges.iter().map(|r| pick(r, row, col)));
+            values.push(f(&cell));
         }
     }
-    Arg::Range(Range {
+    Range {
         rows,
         cols,
         values: Cow::Owned(values),
-    })
+    }
 }
 
 fn call<'a>(name: &str, args: &'a [Expr], ctx: &'a dyn Context) -> Arg<'a> {
