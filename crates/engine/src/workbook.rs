@@ -24,7 +24,7 @@ const READ_ONLY: OpenFlags =
 /// An open .xel file: a SQLite database with xel's metadata tables.
 #[derive(Debug)]
 pub struct Workbook {
-    conn: Connection,
+    pub(crate) conn: Connection,
     format_version: u32,
 }
 
@@ -65,6 +65,7 @@ impl Workbook {
         tx.execute_batch(
             "CREATE TABLE xel_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) STRICT;",
         )?;
+        tx.execute_batch(crate::schema::SCHEMA)?;
         tx.execute(
             "INSERT INTO xel_meta (key, value) VALUES ('format_version', ?1), ('created_by', ?2)",
             (
@@ -118,6 +119,8 @@ impl Workbook {
             Some(version) => version,
             None => identify(&conn, path)?,
         };
+        // Checked after any crash rollback, which restores the file's length.
+        check_length(path)?;
         Self::configure(conn, format_version)
     }
 
@@ -186,6 +189,39 @@ fn identify(conn: &Connection, path: &Path) -> Result<u32> {
             supported: FORMAT_VERSION,
         }),
     }
+}
+
+/// A file shorter than its header says has lost pages. SQLite would only notice when it
+/// reads one, possibly much later; the header check costs one small read.
+fn check_length(path: &Path) -> Result<()> {
+    use std::io::Read;
+    let io = |e| Error::Io {
+        path: path.to_path_buf(),
+        source: e,
+    };
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    let mut header = [0u8; 100];
+    file.read_exact(&mut header).map_err(io)?;
+    // From the SQLite file format: page size at 16 (1 means 65536) and page count at 28,
+    // trusted only when the change counter at 24 matches "version-valid-for" at 92.
+    if header[24..28] != header[92..96] {
+        return Ok(());
+    }
+    let page_size = match u16::from_be_bytes([header[16], header[17]]) {
+        1 => 65_536,
+        n => u64::from(n),
+    };
+    let pages = u64::from(u32::from_be_bytes([
+        header[28], header[29], header[30], header[31],
+    ]));
+    let len = file.metadata().map_err(io)?.len();
+    if len < pages * page_size {
+        return Err(Error::Corrupt(format!(
+            "the file is {len} bytes but its header says {}",
+            pages * page_size
+        )));
+    }
+    Ok(())
 }
 
 /// An absolute path for SQLite. The bundled build always parses `file:` URIs, so a

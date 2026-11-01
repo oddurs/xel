@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::schema::{ColumnId, TableId};
+
 /// Everything the engine can fail with. Callers match on the variant; the message is
 /// for people.
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +30,18 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("{name:?} is not a valid name: {reason}")]
+    InvalidName { name: String, reason: String },
+    #[error("the name {0:?} is already used")]
+    DuplicateName(String),
+    #[error("table {0:?} does not exist")]
+    NoSuchTable(TableId),
+    #[error("column {0:?} does not exist")]
+    NoSuchColumn(ColumnId),
+    #[error("a table must keep at least one column; delete the table instead")]
+    LastColumn(ColumnId),
+    #[error("column {0:?} is not a select column")]
+    NotASelectColumn(ColumnId),
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
