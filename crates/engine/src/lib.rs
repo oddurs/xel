@@ -7,10 +7,12 @@
 mod cell_ref;
 mod error;
 pub mod formula;
+mod schema;
 #[cfg(test)]
 mod test_support;
 mod workbook;
 
 pub use cell_ref::{CellRef, ParseCellRefError};
 pub use error::{Error, Result};
+pub use schema::{Column, ColumnId, ColumnType, Table, TableId};
 pub use workbook::{FORMAT_VERSION, Workbook};
