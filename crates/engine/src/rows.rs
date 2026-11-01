@@ -134,12 +134,21 @@ impl Workbook {
     ) -> Result<()> {
         let t = self.table(table)?;
         let mut writes = Vec::with_capacity(cells.len());
+        let mut index = std::collections::HashMap::new();
         for (column, row, value) in cells {
             let col = column_of(&t, *column)?;
             if row.table != table {
                 return Err(Error::NoSuchRow(*row));
             }
-            writes.push((col, row.id, stored(col, value)?));
+            // The last write to a cell wins, as if the writes were applied in order.
+            let write = (col, row.id, stored(col, value)?);
+            match index.entry((col.id, row.id)) {
+                std::collections::hash_map::Entry::Occupied(at) => writes[*at.get()] = write,
+                std::collections::hash_map::Entry::Vacant(at) => {
+                    at.insert(writes.len());
+                    writes.push(write);
+                }
+            }
         }
         self.edit(|tx| {
             let mut changes = Vec::with_capacity(writes.len());

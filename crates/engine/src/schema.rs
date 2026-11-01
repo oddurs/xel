@@ -472,7 +472,7 @@ fn check_table_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn table_name(conn: &Connection, id: TableId) -> Result<String> {
+pub(crate) fn table_name(conn: &Connection, id: TableId) -> Result<String> {
     conn.query_row("SELECT name FROM xel_tables WHERE id = ?1", [id.0], |r| {
         r.get(0)
     })

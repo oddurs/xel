@@ -1,16 +1,18 @@
 //! Undo and redo. Every edit is described as a [`Change`] with an exact inverse and
 //! applied by [`apply`], so forward edits, undo, and redo run the same code.
 //!
-//! Deleted tables and columns are not dropped: their data moves to `xel_trash_*` tables
-//! so undo can bring it back without holding it in memory. Trash is dropped when no
-//! history entry can need it any more, when the workbook closes, and on the next open
-//! after a crash.
+//! Deleted tables and columns are not dropped: their data moves to trash tables so undo
+//! can bring it back without holding it in memory. Trash names carry the session that
+//! made them, so two workbooks open on one file never drop each other's trash. A session
+//! drops its trash when no history entry can need it any more, and on close.
+
+use std::collections::HashMap;
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::error::{Error, Result};
-use crate::schema::{ColumnId, ColumnType, ROW_ID, TableId, quote};
+use crate::schema::{ColumnId, ColumnType, ROW_ID, TableId, quote, table_name};
 use crate::workbook::Workbook;
 
 /// How many edits undo reaches back.
@@ -102,8 +104,8 @@ pub(crate) enum Change {
 }
 
 impl Change {
-    pub(crate) fn inverse(&self) -> Self {
-        match self.clone() {
+    pub(crate) fn into_inverse(self) -> Self {
+        match self {
             Self::CreateTable { spec, .. } => Self::DeleteTable { spec },
             Self::DeleteTable { spec } => Self::CreateTable {
                 spec,
@@ -153,36 +155,77 @@ impl Change {
     }
 
     /// The trash table this change would restore from, if any.
-    fn trash(&self) -> Option<String> {
+    fn trash(&self, session: Session) -> Option<String> {
         match self {
             Self::CreateTable {
                 spec,
                 from_trash: true,
-            } => Some(table_trash(spec.id)),
+            } => Some(session.table_trash(spec.id)),
             Self::AddColumn {
                 spec,
                 from_trash: true,
                 ..
-            } => Some(column_trash(spec.id)),
+            } => Some(session.column_trash(spec.id)),
             _ => None,
         }
     }
 }
 
-fn table_trash(id: TableId) -> String {
-    format!("xel_trash_table_{}", id.0)
+fn invert(entry: Vec<Change>) -> Vec<Change> {
+    entry.into_iter().rev().map(Change::into_inverse).collect()
 }
 
-fn column_trash(id: ColumnId) -> String {
-    format!("xel_trash_column_{}", id.0)
+/// Identifies one open workbook's trash among any others on the same file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Session(u64);
+
+impl Session {
+    /// Unique enough among workbooks open on one file at once: the time, this process,
+    /// and a per-process counter.
+    pub(crate) fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos().into());
+        let mixed = nanos
+            ^ (u64::from(std::process::id()) << 32)
+            ^ COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        Self(mixed)
+    }
+
+    fn prefix(self) -> String {
+        format!("xel_trash_{:016x}_", self.0)
+    }
+
+    fn table_trash(self, id: TableId) -> String {
+        format!("{}table_{}", self.prefix(), id.0)
+    }
+
+    fn column_trash(self, id: ColumnId) -> String {
+        format!("{}column_{}", self.prefix(), id.0)
+    }
 }
 
 /// Undo and redo stacks. Each entry is the list of changes that perform it, in order:
 /// inverses on the undo stack, forward changes on the redo stack.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct History {
+    session: Session,
     undo: Vec<Vec<Change>>,
     redo: Vec<Vec<Change>>,
+}
+
+impl History {
+    pub(crate) fn new() -> Self {
+        Self {
+            session: Session::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
+    }
 }
 
 impl Workbook {
@@ -192,6 +235,7 @@ impl Workbook {
         &mut self,
         build: impl FnOnce(&Transaction<'_>) -> Result<(Vec<Change>, T)>,
     ) -> Result<T> {
+        let session = self.history.session;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -200,16 +244,16 @@ impl Workbook {
             return Ok(out);
         }
         for change in &changes {
-            apply(&tx, change)?;
+            apply(&tx, change, session)?;
         }
         // A new edit ends redo, and the oldest undo entry may fall off the end; drop the
         // trash either was keeping, in this same transaction.
         for change in self.history.redo.iter().flatten() {
-            release(&tx, change)?;
+            release(&tx, change, session)?;
         }
         if self.history.undo.len() >= LIMIT {
             for change in &self.history.undo[0] {
-                release(&tx, change)?;
+                release(&tx, change, session)?;
             }
         }
         tx.commit()?;
@@ -217,9 +261,7 @@ impl Workbook {
         if self.history.undo.len() >= LIMIT {
             self.history.undo.remove(0);
         }
-        self.history
-            .undo
-            .push(changes.iter().rev().map(Change::inverse).collect());
+        self.history.undo.push(invert(changes));
         Ok(out)
     }
 
@@ -243,42 +285,59 @@ impl Workbook {
         !self.history.redo.is_empty()
     }
 
+    /// Applies the top entry of one stack and moves its inverse to the other. If the
+    /// entry cannot be applied (another tool changed the file underneath it), the file is
+    /// left as it was, the entry is dropped so it cannot block the rest of history, and
+    /// the error is returned.
     fn replay(&mut self, undo: bool) -> Result<bool> {
+        let session = self.history.session;
         let (from, to) = if undo {
             (&mut self.history.undo, &mut self.history.redo)
         } else {
             (&mut self.history.redo, &mut self.history.undo)
         };
-        let Some(entry) = from.last() else {
+        let Some(entry) = from.pop() else {
             return Ok(false);
         };
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for change in entry {
-            apply(&tx, change)?;
+        let applied = entry
+            .iter()
+            .try_for_each(|change| apply(&tx, change, session));
+        if let Err(e) = applied {
+            drop(tx);
+            // The entry is gone, so its trash is no longer needed. If dropping it fails
+            // too, close() drops every table with this session's prefix anyway, and the
+            // original error is the one worth reporting.
+            for change in &entry {
+                let _ = release(&self.conn, change, session);
+            }
+            return Err(e);
         }
         tx.commit()?;
-        let entry = from.pop().expect("checked above");
-        to.push(entry.iter().rev().map(Change::inverse).collect());
+        to.push(invert(entry));
         Ok(true)
     }
-}
 
-/// Drops every trash table: nothing can restore from them once history is gone.
-pub(crate) fn purge_trash(conn: &Connection) -> Result<()> {
-    let names: Vec<String> = conn
-        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name GLOB 'xel_trash_*'")?
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for name in names {
-        conn.execute_batch(&format!("DROP TABLE {};", quote(&name)))?;
+    /// Drops this session's trash: nothing can restore from it once history ends.
+    pub(crate) fn purge_trash(&self) -> Result<()> {
+        let pattern = format!("{}*", self.history.session.prefix());
+        let names: Vec<String> = self
+            .conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name GLOB ?1")?
+            .query_map([pattern], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for name in names {
+            self.conn
+                .execute_batch(&format!("DROP TABLE {};", quote(&name)))?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
-fn release(conn: &Connection, change: &Change) -> Result<()> {
-    if let Some(trash) = change.trash() {
+fn release(conn: &Connection, change: &Change, session: Session) -> Result<()> {
+    if let Some(trash) = change.trash(session) {
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {};", quote(&trash)))?;
     }
     Ok(())
@@ -297,20 +356,30 @@ pub(crate) fn next_id(conn: &Connection, table: &str) -> Result<i64> {
     Ok(seq.unwrap_or(0) + 1)
 }
 
-fn table_name(conn: &Connection, id: TableId) -> Result<String> {
-    conn.query_row("SELECT name FROM xel_tables WHERE id = ?1", [id.0], |r| {
-        r.get(0)
-    })
-    .optional()?
-    .ok_or(Error::NoSuchTable(id))
+/// Quoted names of a table's columns, looked up once per change rather than per value.
+fn column_names(conn: &Connection, table: TableId) -> Result<HashMap<ColumnId, String>> {
+    let names = conn
+        .prepare("SELECT id, name FROM xel_columns WHERE table_id = ?1")?
+        .query_map([table.0], |r| {
+            Ok((ColumnId(r.get(0)?), quote(&r.get::<_, String>(1)?)))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(names)
 }
 
-fn column_name(conn: &Connection, id: ColumnId) -> Result<String> {
-    conn.query_row("SELECT name FROM xel_columns WHERE id = ?1", [id.0], |r| {
-        r.get(0)
-    })
-    .optional()?
-    .ok_or(Error::NoSuchColumn(id))
+fn named(names: &HashMap<ColumnId, String>, id: ColumnId) -> Result<&str> {
+    names
+        .get(&id)
+        .map(String::as_str)
+        .ok_or(Error::NoSuchColumn(id))
+}
+
+/// A row an undo or redo expected to find is gone: another tool changed the table.
+fn vanished(table: TableId, row: i64) -> Error {
+    Error::Corrupt(format!(
+        "row {row} of table {} changed outside xel",
+        table.0
+    ))
 }
 
 fn insert_column_metadata(conn: &Connection, table: TableId, spec: &ColumnSpec) -> Result<()> {
@@ -343,7 +412,7 @@ fn set_options(conn: &Connection, column: ColumnId, options: &[String]) -> Resul
 
 /// Renames a SQL table, stepping through a temporary name for a case-only change, which
 /// SQLite would otherwise see as renaming onto an existing table.
-pub(crate) fn rename_sql_table(conn: &Connection, id: TableId, from: &str, to: &str) -> Result<()> {
+fn rename_sql_table(conn: &Connection, id: TableId, from: &str, to: &str) -> Result<()> {
     if from.eq_ignore_ascii_case(to) && from != to {
         let step = quote(&format!("xel_rename_{}", id.0));
         conn.execute_batch(&format!("ALTER TABLE {} RENAME TO {step};", quote(from)))?;
@@ -363,11 +432,12 @@ pub(crate) fn rename_sql_table(conn: &Connection, id: TableId, from: &str, to: &
     clippy::too_many_lines,
     reason = "one arm per kind of change reads best together"
 )]
-pub(crate) fn apply(conn: &Connection, change: &Change) -> Result<()> {
+fn apply(conn: &Connection, change: &Change, session: Session) -> Result<()> {
+    let id = quote(ROW_ID);
     match change {
         Change::CreateTable { spec, from_trash } => {
             if *from_trash {
-                rename_sql_table(conn, spec.id, &table_trash(spec.id), &spec.name)?;
+                rename_sql_table(conn, spec.id, &session.table_trash(spec.id), &spec.name)?;
             } else {
                 let defs: Vec<String> = spec
                     .columns
@@ -377,9 +447,8 @@ pub(crate) fn apply(conn: &Connection, change: &Change) -> Result<()> {
                 conn.execute_batch(&format!(
                     // AUTOINCREMENT: a deleted row's id is never handed out again, so an
                     // id held by undo, a selection, or a script cannot point at another row.
-                    "CREATE TABLE {} ({} INTEGER PRIMARY KEY AUTOINCREMENT, {}) STRICT;",
+                    "CREATE TABLE {} ({id} INTEGER PRIMARY KEY AUTOINCREMENT, {}) STRICT;",
                     quote(&spec.name),
-                    quote(ROW_ID),
                     defs.join(", ")
                 ))?;
             }
@@ -392,14 +461,18 @@ pub(crate) fn apply(conn: &Connection, change: &Change) -> Result<()> {
             }
         }
         Change::DeleteTable { spec } => {
-            rename_sql_table(conn, spec.id, &spec.name, &table_trash(spec.id))?;
+            rename_sql_table(conn, spec.id, &spec.name, &session.table_trash(spec.id))?;
             conn.execute("DELETE FROM xel_tables WHERE id = ?1", [spec.id.0])?;
         }
-        Change::RenameTable { id, from, to } => {
-            rename_sql_table(conn, *id, from, to)?;
+        Change::RenameTable {
+            id: table,
+            from,
+            to,
+        } => {
+            rename_sql_table(conn, *table, from, to)?;
             conn.execute(
                 "UPDATE xel_tables SET name = ?1 WHERE id = ?2",
-                params![to, id.0],
+                params![to, table.0],
             )?;
         }
         Change::AddColumn {
@@ -415,10 +488,9 @@ pub(crate) fn apply(conn: &Connection, change: &Change) -> Result<()> {
             ))?;
             insert_column_metadata(conn, *table, spec)?;
             if *from_trash {
-                let trash = quote(&column_trash(spec.id));
-                let id = quote(ROW_ID);
+                let trash = quote(&session.column_trash(spec.id));
                 conn.execute_batch(&format!(
-                    "UPDATE {t} SET {col} = (SELECT value FROM {trash} WHERE {trash}.{id} = {t}.{id}); \
+                    "UPDATE {t} SET {col} = {trash}.value FROM {trash} WHERE {trash}.{id} = {t}.{id}; \
                      DROP TABLE {trash};"
                 ))?;
             }
@@ -426,17 +498,18 @@ pub(crate) fn apply(conn: &Connection, change: &Change) -> Result<()> {
         Change::DeleteColumn { table, spec } => {
             let t = quote(&table_name(conn, *table)?);
             let col = quote(&spec.name);
-            let trash = quote(&column_trash(spec.id));
+            let trash = quote(&session.column_trash(spec.id));
+            // A primary key on the trash keeps the restore a join, not a scan per row.
             conn.execute_batch(&format!(
-                "CREATE TABLE {trash} AS SELECT {id}, {col} AS value FROM {t}; \
-                 ALTER TABLE {t} DROP COLUMN {col};",
-                id = quote(ROW_ID),
+                "CREATE TABLE {trash} ({id} INTEGER PRIMARY KEY, value ANY) STRICT; \
+                 INSERT INTO {trash} SELECT {id}, {col} FROM {t}; \
+                 ALTER TABLE {t} DROP COLUMN {col};"
             ))?;
             conn.execute("DELETE FROM xel_columns WHERE id = ?1", [spec.id.0])?;
         }
         Change::RenameColumn {
             table,
-            id,
+            id: column,
             from,
             to,
         } => {
@@ -448,44 +521,48 @@ pub(crate) fn apply(conn: &Connection, change: &Change) -> Result<()> {
             ))?;
             conn.execute(
                 "UPDATE xel_columns SET name = ?1 WHERE id = ?2",
-                params![to, id.0],
+                params![to, column.0],
             )?;
         }
         Change::SetOptions { column, to, .. } => set_options(conn, *column, to)?,
         Change::InsertRows { table, rows } => {
             let t = quote(&table_name(conn, *table)?);
+            let names = column_names(conn, *table)?;
             for row in rows {
-                let mut names = vec![quote(ROW_ID)];
+                let mut cols = vec![id.clone()];
                 let mut values = vec![SqlValue::Integer(row.id)];
                 for (column, value) in &row.values {
-                    names.push(quote(&column_name(conn, *column)?));
+                    cols.push(named(&names, *column)?.to_string());
                     values.push(value.clone());
                 }
-                let marks = vec!["?"; names.len()].join(", ");
-                conn.prepare_cached(&format!(
-                    "INSERT INTO {t} ({}) VALUES ({marks})",
-                    names.join(", ")
-                ))?
-                .execute(rusqlite::params_from_iter(values))?;
+                let marks = vec!["?"; cols.len()].join(", ");
+                let sql = format!("INSERT INTO {t} ({}) VALUES ({marks})", cols.join(", "));
+                conn.prepare_cached(&sql)?
+                    .execute(rusqlite::params_from_iter(values))?;
             }
         }
         Change::DeleteRows { table, rows } => {
             let t = quote(&table_name(conn, *table)?);
-            let mut stmt =
-                conn.prepare_cached(&format!("DELETE FROM {t} WHERE {} = ?1", quote(ROW_ID)))?;
+            let mut stmt = conn.prepare_cached(&format!("DELETE FROM {t} WHERE {id} = ?1"))?;
             for row in rows {
-                stmt.execute([row.id])?;
+                if stmt.execute([row.id])? == 0 {
+                    return Err(vanished(*table, row.id));
+                }
             }
         }
         Change::SetCells { table, cells } => {
             let t = quote(&table_name(conn, *table)?);
+            let names = column_names(conn, *table)?;
             for cell in cells {
-                let col = quote(&column_name(conn, cell.column)?);
-                conn.prepare_cached(&format!(
-                    "UPDATE {t} SET {col} = ?1 WHERE {} = ?2",
-                    quote(ROW_ID)
-                ))?
-                .execute(params![cell.to, cell.row])?;
+                let col = named(&names, cell.column)?;
+                let sql = format!("UPDATE {t} SET {col} = ?1 WHERE {id} = ?2");
+                if conn
+                    .prepare_cached(&sql)?
+                    .execute(params![cell.to, cell.row])?
+                    == 0
+                {
+                    return Err(vanished(*table, cell.row));
+                }
             }
         }
     }
@@ -500,6 +577,7 @@ mod tests {
 
     use super::*;
     use crate::cell::{CellValue, Date};
+    use crate::error::Error;
     use crate::rows::RowId;
     use crate::test_support::TempDir;
 
@@ -744,12 +822,64 @@ mod tests {
         book.close().unwrap();
         let raw = Connection::open(&path).unwrap();
         assert_eq!(trash_count(&raw), 0, "close drops trash");
-        // A crash leaves trash behind; the next open drops it.
-        raw.execute_batch("CREATE TABLE xel_trash_table_99 (x)")
+    }
+
+    #[test]
+    fn two_workbooks_on_one_file_keep_their_own_trash() {
+        let dir = TempDir::new();
+        let (mut first, path) = book(&dir);
+        let t = first.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        first.delete_table(t).unwrap();
+        let second = Workbook::open(&path).unwrap();
+        second.close().unwrap();
+        assert!(
+            first.undo().unwrap(),
+            "the second workbook left the first one's trash alone"
+        );
+        assert_eq!(first.table(t).unwrap().name, "T");
+    }
+
+    #[test]
+    fn an_undo_that_cannot_apply_is_dropped_instead_of_blocking_history() {
+        let dir = TempDir::new();
+        let (mut book, path) = book(&dir);
+        let t = book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        let a = book.table(t).unwrap().columns[0].id;
+        let row = book.insert_row(t, &[]).unwrap();
+        book.set_cell(a, row, &CellValue::Text("x".into())).unwrap();
+        // Another tool deletes the row the latest edit touched.
+        Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM T", [])
             .unwrap();
-        drop(raw);
-        let book = Workbook::open(&path).unwrap();
-        assert_eq!(trash_count(&book.conn), 0);
+        assert!(matches!(book.undo(), Err(Error::Corrupt(_))));
+        assert!(book.can_undo(), "earlier edits are still undoable");
+        assert!(
+            book.undo().is_err(),
+            "undoing the insert finds the row gone too"
+        );
+        assert!(book.undo().unwrap(), "undoing create_table still works");
+        assert!(book.tables().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_last_write_to_a_cell_in_one_paste_wins() {
+        let dir = TempDir::new();
+        let (mut book, _) = book(&dir);
+        let t = book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        let a = book.table(t).unwrap().columns[0].id;
+        let row = book
+            .insert_row(t, &[(a, CellValue::Text("x".into()))])
+            .unwrap();
+        let text = |s: &str| CellValue::Text(s.into());
+        book.set_cells(t, &[(a, row, text("b")), (a, row, text("x"))])
+            .unwrap();
+        assert_eq!(book.rows(t, 0, 1).unwrap()[0].cells[0], text("x"));
+        book.set_cells(t, &[(a, row, text("b")), (a, row, text("c"))])
+            .unwrap();
+        assert_eq!(book.rows(t, 0, 1).unwrap()[0].cells[0], text("c"));
+        book.undo().unwrap();
+        assert_eq!(book.rows(t, 0, 1).unwrap()[0].cells[0], text("x"));
     }
 
     #[test]
@@ -813,7 +943,7 @@ mod tests {
                 .first()
                 .map_or(CellValue::Empty, |o| CellValue::Text(o.clone())),
         };
-        let _ = match (rng.below(11), table) {
+        let outcome = match (rng.below(11), table) {
             (0, _) | (_, None) => book
                 .create_table(
                     &format!("T{n}"),
@@ -872,6 +1002,12 @@ mod tests {
                 book.delete_rows(t, &doomed)
             }
         };
+        // Random edits may break validation rules; anything else is a real failure.
+        match outcome {
+            Ok(())
+            | Err(Error::LastColumn(_) | Error::NotAnOption { .. } | Error::DuplicateName(_)) => {}
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
     }
 
     #[test]
