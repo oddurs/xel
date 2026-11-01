@@ -317,7 +317,7 @@ fn read_cell(col: &Column, raw: ValueRef<'_>) -> Result<CellValue> {
     };
     Ok(match (col.ty, raw) {
         (ColumnType::Formula, raw) => {
-            match crate::recalc::formula_value(ColumnType::Formula, raw) {
+            match crate::recalc::formula_value(ColumnType::Formula, col.formula_dates, raw) {
                 Value::Empty => CellValue::Empty,
                 Value::Number(n) => CellValue::Number(n),
                 Value::Text(s) => CellValue::Text(s),

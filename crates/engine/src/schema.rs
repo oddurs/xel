@@ -26,6 +26,8 @@ CREATE TABLE xel_columns (
     position INTEGER NOT NULL,
     -- The formula text of a formula column; NULL for every other type.
     formula TEXT CHECK ((type = 'formula') = (formula IS NOT NULL)),
+    -- 'date' when a formula column's results are dates, so its ISO text reads back as dates.
+    formula_kind TEXT CHECK (formula_kind IS NULL OR formula_kind = 'date'),
     UNIQUE (table_id, name)
 ) STRICT;
 CREATE TABLE xel_select_options (
@@ -129,6 +131,8 @@ pub struct Column {
     pub options: Vec<String>,
     /// The formula of a `Formula` column, as written; `None` for other types.
     pub formula: Option<String>,
+    /// Whether a formula column's results are dates (see `recalc`).
+    pub(crate) formula_dates: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,10 +244,32 @@ impl Workbook {
 
     /// Adds a column at the end of the table.
     pub fn add_column(&mut self, table: TableId, name: &str, ty: ColumnType) -> Result<ColumnId> {
-        check_column_name(name)?;
         if ty == ColumnType::Formula {
             return Err(Error::NeedsFormula(name.into()));
         }
+        self.append_column(table, name, ty, None)
+    }
+
+    /// Adds a column computed by a formula, such as `=[@Qty]*[@Price]`, and computes it
+    /// for every row.
+    pub fn add_formula_column(
+        &mut self,
+        table: TableId,
+        name: &str,
+        formula: &str,
+    ) -> Result<ColumnId> {
+        check_formula(name, formula)?;
+        self.append_column(table, name, ColumnType::Formula, Some(formula.into()))
+    }
+
+    fn append_column(
+        &mut self,
+        table: TableId,
+        name: &str,
+        ty: ColumnType,
+        formula: Option<String>,
+    ) -> Result<ColumnId> {
+        check_column_name(name)?;
         self.edit(|tx| {
             table_name(tx, table)?;
             ensure_column_name_free(tx, table, name, None)?;
@@ -259,45 +285,7 @@ impl Workbook {
                 ty,
                 position,
                 options: Vec::new(),
-                formula: None,
-            };
-            Ok((
-                vec![Change::AddColumn {
-                    table,
-                    spec,
-                    from_trash: false,
-                }],
-                id,
-            ))
-        })
-    }
-
-    /// Adds a column computed by a formula, such as `=[@Qty]*[@Price]`, and computes it
-    /// for every row.
-    pub fn add_formula_column(
-        &mut self,
-        table: TableId,
-        name: &str,
-        formula: &str,
-    ) -> Result<ColumnId> {
-        check_column_name(name)?;
-        check_formula(name, formula)?;
-        self.edit(|tx| {
-            table_name(tx, table)?;
-            ensure_column_name_free(tx, table, name, None)?;
-            let id = ColumnId(next_id(tx, "xel_columns")?);
-            let position: i64 = tx.query_row(
-                "SELECT coalesce(max(position), -1) + 1 FROM xel_columns WHERE table_id = ?1",
-                [table.0],
-                |r| r.get(0),
-            )?;
-            let spec = ColumnSpec {
-                id,
-                name: name.into(),
-                ty: ColumnType::Formula,
-                position,
-                options: Vec::new(),
-                formula: Some(formula.into()),
+                formula,
             };
             Ok((
                 vec![Change::AddColumn {
@@ -465,7 +453,7 @@ pub(crate) fn load_table(conn: &Connection, id: TableId) -> Result<Table> {
 /// Loads every table, or just `only`, with columns and options in one query.
 fn load_tables(conn: &Connection, only: Option<TableId>) -> Result<Vec<Table>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, c.id, c.name, c.type, o.value, c.formula
+        "SELECT t.id, t.name, c.id, c.name, c.type, o.value, c.formula, c.formula_kind
          FROM xel_tables t
          LEFT JOIN xel_columns c ON c.table_id = t.id
          LEFT JOIN xel_select_options o ON o.column_id = c.id
@@ -494,6 +482,7 @@ fn load_tables(conn: &Connection, only: Option<TableId>) -> Result<Vec<Table>> {
                 ty: ColumnType::parse(&r.get::<_, String>(4)?)?,
                 options: Vec::new(),
                 formula: r.get(6)?,
+                formula_dates: r.get::<_, Option<String>>(7)?.as_deref() == Some("date"),
             });
         }
         if let Some(option) = r.get::<_, Option<String>>(5)? {

@@ -8,6 +8,7 @@ mod parser;
 mod value;
 
 pub use ast::{A1, BinaryOp, ErrorKind, Expr, Reference, UnaryOp};
+pub(crate) use eval::eval_arg;
 pub use eval::{Arg, Args, Context, Function, Range, evaluate, function, functions};
 pub use parser::{ParseError, ParseErrorKind, parse};
 pub use value::{

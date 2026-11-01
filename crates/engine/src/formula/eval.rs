@@ -209,7 +209,9 @@ enum Step<'e> {
     Unary(UnaryOp),
 }
 
-fn eval_arg<'a>(expr: &'a Expr, ctx: &'a dyn Context) -> Arg<'a> {
+/// Evaluates to an argument, keeping a range a range, for callers that must tell a
+/// single value from an array.
+pub(crate) fn eval_arg<'a>(expr: &'a Expr, ctx: &'a dyn Context) -> Arg<'a> {
     // `1+1+…+1` and `1%%…%` nest to the left one level per operator, deeper than the
     // parser's nesting limit counts. Walk that spine with a loop, not recursion.
     let mut spine = Vec::new();

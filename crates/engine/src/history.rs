@@ -652,7 +652,7 @@ mod tests {
         );
         dump(
             conn,
-            "SELECT id, table_id, name, type, position FROM xel_columns ORDER BY id",
+            "SELECT id, table_id, name, type, position, formula, formula_kind FROM xel_columns ORDER BY id",
             &mut out,
         );
         dump(
@@ -980,6 +980,10 @@ mod tests {
 
     /// One random edit. Returns whether it changed anything; edits that fail validation
     /// (an option that does not exist, the last column) are allowed and change nothing.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per kind of edit reads best together"
+    )]
     fn random_edit(book: &mut Workbook, rng: &mut Rng, n: usize) {
         const TYPES: [ColumnType; 5] = [
             ColumnType::Text,
@@ -1024,6 +1028,13 @@ mod tests {
             (5, Some(t)) => {
                 let cols = book.table(t).unwrap().columns;
                 book.delete_column(cols[rng.below(cols.len())].id)
+            }
+            (6, Some(t)) if rng.below(3) == 0 => {
+                let cols = book.table(t).unwrap().columns;
+                match cols.iter().find(|c| c.ty == ColumnType::Formula) {
+                    Some(c) => book.set_formula(c.id, &format!("=\"v{n}\"&[@a]")),
+                    None => Ok(()),
+                }
             }
             (6, Some(t)) if rng.below(2) == 0 => book
                 .add_formula_column(t, &format!("f{n}"), "=[@a]&\"!\"")

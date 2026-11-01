@@ -2,9 +2,13 @@
 //! SQLite tool reads what xel shows.
 //!
 //! History records only inputs and formula definitions; after every edit, undo, or redo,
-//! [`after`] recomputes what the applied changes can have affected. A formula that reads
-//! only its own row is recomputed for the rows that changed; one that reads a whole column
-//! (`SUM([Qty])`), or depends on such a formula, is recomputed for every row.
+//! [`after`] recomputes what the applied changes can have affected:
+//! - A cell edit recomputes, for the edited rows, the formulas that read an edited column,
+//!   and the formulas downstream of them.
+//! - A formula that reads a whole column (`SUM([Qty])`), or depends on one, is recomputed
+//!   for every row when anything it reads changes. Parts of a formula that do not depend
+//!   on the row are evaluated once per pass, so `[@Qty]/SUM([Qty])` stays linear.
+//! - Formula, column, and table changes recompute every formula of the table.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
@@ -14,28 +18,60 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 
 use crate::error::{Error, Result};
 use crate::formula::{
-    Context, ErrorKind, Expr, Reference, Value, evaluate, iso_from_serial, parse, serial_from_iso,
+    Arg, Context, ErrorKind, Expr, Reference, Value, eval_arg, evaluate, function, iso_from_serial,
+    number_from_text, parse, serial_from_iso,
 };
 use crate::history::Change;
-use crate::schema::{ColumnType, ROW_ID, Table, TableId, quote};
+use crate::schema::{Column, ColumnId, ColumnType, ROW_ID, Table, TableId, quote};
 
-/// Which rows of a table to recompute.
+/// Above this many rows, recomputing a formula scans the table once instead of querying
+/// row by row.
+const ROW_BY_ROW: usize = 1000;
+
+/// Which rows of a table to recompute, and why.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Scope {
     All,
-    /// These rows; formulas that read whole columns recompute every row regardless.
-    Rows(BTreeSet<i64>),
+    Rows {
+        rows: BTreeSet<i64>,
+        /// The columns whose cells changed; `None` when whole rows came or went.
+        columns: Option<BTreeSet<ColumnId>>,
+    },
+}
+
+impl Scope {
+    fn rows(rows: BTreeSet<i64>, columns: Option<BTreeSet<ColumnId>>) -> Self {
+        Self::Rows { rows, columns }
+    }
+
+    fn widen(&mut self, other: Self) {
+        match (self, other) {
+            (Self::All, _) => {}
+            (me @ Self::Rows { .. }, Self::All) => *me = Self::All,
+            (
+                Self::Rows { rows, columns },
+                Self::Rows {
+                    rows: more,
+                    columns: cols,
+                },
+            ) => {
+                rows.extend(more);
+                match (columns.as_mut(), cols) {
+                    (Some(mine), Some(theirs)) => mine.extend(theirs),
+                    _ => *columns = None,
+                }
+            }
+        }
+    }
 }
 
 /// Recomputes whatever `changes` can have affected.
 pub(crate) fn after(conn: &Connection, changes: &[Change]) -> Result<()> {
     let mut scopes: HashMap<TableId, Scope> = HashMap::new();
-    let mut widen = |table: TableId, scope: Scope| {
-        let entry = scopes.entry(table).or_insert(Scope::Rows(BTreeSet::new()));
-        match (entry, scope) {
-            (entry @ Scope::Rows(_), Scope::All) => *entry = Scope::All,
-            (Scope::Rows(rows), Scope::Rows(more)) => rows.extend(more),
-            (Scope::All, _) => {}
+    let mut widen = |table: TableId, scope: Scope| match scopes.get_mut(&table) {
+        Some(existing) => existing.widen(scope),
+        None => {
+            scopes.insert(table, scope);
         }
     };
     for change in changes {
@@ -49,13 +85,20 @@ pub(crate) fn after(conn: &Connection, changes: &[Change]) -> Result<()> {
             | Change::RenameColumn { table, .. }
             | Change::SetFormula { table, .. } => widen(*table, Scope::All),
             Change::InsertRows { table, rows } => {
-                widen(*table, Scope::Rows(rows.iter().map(|r| r.id).collect()));
+                widen(
+                    *table,
+                    Scope::rows(rows.iter().map(|r| r.id).collect(), None),
+                );
             }
-            // No row left to recompute, but formulas over whole columns must see the loss.
-            Change::DeleteRows { table, .. } => widen(*table, Scope::Rows(BTreeSet::new())),
-            Change::SetCells { table, cells } => {
-                widen(*table, Scope::Rows(cells.iter().map(|c| c.row).collect()));
-            }
+            // No row is left to recompute, but formulas over whole columns see the loss.
+            Change::DeleteRows { table, .. } => widen(*table, Scope::rows(BTreeSet::new(), None)),
+            Change::SetCells { table, cells } => widen(
+                *table,
+                Scope::rows(
+                    cells.iter().map(|c| c.row).collect(),
+                    Some(cells.iter().map(|c| c.column).collect()),
+                ),
+            ),
             Change::DeleteTable { .. } | Change::SetOptions { .. } => {}
         }
     }
@@ -70,8 +113,8 @@ pub(crate) fn after(conn: &Connection, changes: &[Change]) -> Result<()> {
 }
 
 /// A formula column and what it reads.
-struct Formula {
-    name: String,
+struct Formula<'t> {
+    column: &'t Column,
     /// `None` if the stored formula no longer parses; every cell shows `#NAME?`.
     expr: Option<Expr>,
     /// Lower-cased names of columns read in this row (`[@Col]`) and as a whole (`[Col]`).
@@ -79,71 +122,102 @@ struct Formula {
     whole: BTreeSet<String>,
 }
 
-impl Formula {
+impl Formula<'_> {
     fn reads(&self) -> impl Iterator<Item = &String> {
         self.this_row.iter().chain(&self.whole)
     }
 }
 
+fn lower(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 /// Recomputes the formula columns of `table` for `scope`.
 pub(crate) fn run(conn: &Connection, table: TableId, scope: &Scope) -> Result<()> {
     let t = crate::schema::load_table(conn, table)?;
-    let formulas: Vec<Formula> = t
+    let formulas: Vec<Formula<'_>> = t
         .columns
         .iter()
-        .filter_map(|c| {
-            c.formula
-                .as_ref()
-                .map(|text| analyze(&c.name, text, &t.name))
-        })
+        .filter_map(|c| c.formula.as_ref().map(|text| analyze(c, text, &t.name)))
         .collect();
     if formulas.is_empty() {
         return Ok(());
     }
-    let (order, cyclic) = order(&formulas);
+    let index_of = |name: &str| formulas.iter().position(|f| lower(&f.column.name) == name);
+    let (order, cyclic) = order(&formulas, &index_of);
 
-    // Formulas reading a whole column, and everything downstream of them, cover all rows.
+    // Which formulas this scope touches: all of them, or those reading an edited column,
+    // and everything downstream either way.
+    let mut touched: BTreeSet<usize> = match scope {
+        Scope::All | Scope::Rows { columns: None, .. } => (0..formulas.len()).collect(),
+        Scope::Rows {
+            columns: Some(changed),
+            ..
+        } => {
+            let names: BTreeSet<String> = t
+                .columns
+                .iter()
+                .filter(|c| changed.contains(&c.id))
+                .map(|c| lower(&c.name))
+                .collect();
+            (0..formulas.len())
+                .filter(|&i| formulas[i].reads().any(|n| names.contains(n)))
+                .collect()
+        }
+    };
+    // Formulas over whole columns, and everything downstream, cover every row.
     let mut everywhere: BTreeSet<usize> = (0..formulas.len())
         .filter(|&i| !formulas[i].whole.is_empty())
         .collect();
     for &i in &order {
-        if formulas[i]
-            .reads()
-            .any(|n| index_of(&formulas, n).is_some_and(|j| everywhere.contains(&j)))
-        {
+        let upstream: Vec<usize> = formulas[i].reads().filter_map(|n| index_of(n)).collect();
+        if upstream.iter().any(|j| touched.contains(j)) {
+            touched.insert(i);
+        }
+        if upstream.iter().any(|j| everywhere.contains(j)) {
             everywhere.insert(i);
         }
     }
 
-    for &i in &order {
+    // Whether each formula column holds dates, updated as the pass recomputes them, so a
+    // formula reading another formula column sees its current kind.
+    let mut dates: HashMap<ColumnId, bool> =
+        t.columns.iter().map(|c| (c.id, c.formula_dates)).collect();
+    for &i in order.iter().filter(|i| touched.contains(i)) {
         let rows = match scope {
-            Scope::All => Scope::All,
-            Scope::Rows(_) if everywhere.contains(&i) => Scope::All,
-            Scope::Rows(rows) if rows.is_empty() => continue,
-            Scope::Rows(rows) => Scope::Rows(rows.clone()),
+            Scope::All => None,
+            Scope::Rows { .. } if everywhere.contains(&i) => None,
+            Scope::Rows { rows, .. } if rows.len() > ROW_BY_ROW => None,
+            Scope::Rows { rows, .. } if rows.is_empty() => continue,
+            Scope::Rows { rows, .. } => Some(rows),
         };
-        compute(conn, &t, &formulas[i], &rows)?;
+        let now_dates = compute(conn, &t, &formulas[i], rows, &dates)?;
+        dates.insert(formulas[i].column.id, now_dates);
     }
-    // A cycle has no order to compute in. Each column in or behind one shows an error
-    // instead of a stale value; 0027 refines how cycles are reported.
-    for i in cyclic {
-        fill(conn, &t, &formulas[i].name, &Value::Error(ErrorKind::Ref))?;
+    // A cycle has no order to compute in; its columns show an error instead of a stale
+    // value. Nothing a cell edit does can change that, so it is written only on full passes.
+    if *scope == Scope::All {
+        for i in cyclic {
+            fill(
+                conn,
+                &t,
+                &formulas[i].column.name,
+                &Value::Error(ErrorKind::Ref),
+            )?;
+        }
     }
     Ok(())
 }
 
-fn index_of(formulas: &[Formula], lower_name: &str) -> Option<usize> {
-    formulas
-        .iter()
-        .position(|f| f.name.to_ascii_lowercase() == lower_name)
-}
-
 /// Orders formulas so each comes after the formulas it reads; returns the order and the
 /// formulas left over because they are in, or depend on, a cycle.
-fn order(formulas: &[Formula]) -> (Vec<usize>, Vec<usize>) {
+fn order(
+    formulas: &[Formula<'_>],
+    index_of: &dyn Fn(&str) -> Option<usize>,
+) -> (Vec<usize>, Vec<usize>) {
     let deps: Vec<BTreeSet<usize>> = formulas
         .iter()
-        .map(|f| f.reads().filter_map(|n| index_of(formulas, n)).collect())
+        .map(|f| f.reads().filter_map(|n| index_of(n)).collect())
         .collect();
     let mut done = vec![false; formulas.len()];
     let mut order = Vec::new();
@@ -164,9 +238,9 @@ fn order(formulas: &[Formula]) -> (Vec<usize>, Vec<usize>) {
 }
 
 /// Parses a formula and lists the columns of its own table that it reads.
-fn analyze(name: &str, text: &str, table: &str) -> Formula {
+fn analyze<'t>(column: &'t Column, text: &str, table: &str) -> Formula<'t> {
     let mut f = Formula {
-        name: name.into(),
+        column,
         expr: parse(text).ok(),
         this_row: BTreeSet::new(),
         whole: BTreeSet::new(),
@@ -186,7 +260,7 @@ fn analyze(name: &str, text: &str, table: &str) -> Formula {
                     } else {
                         &mut f.whole
                     };
-                    set.insert(column.to_ascii_lowercase());
+                    set.insert(lower(column));
                 }
             }
             Expr::Unary { expr, .. } => stack.push(expr),
@@ -199,6 +273,64 @@ fn analyze(name: &str, text: &str, table: &str) -> Formula {
         }
     }
     f
+}
+
+/// Whether `expr` can give a different result in different rows: it reads this row, a
+/// name, or calls a volatile function.
+fn varies_by_row(expr: &Expr) -> bool {
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Ref(Reference::Structured { this_row: true, .. }) | Expr::Name(_) => return true,
+            Expr::Call { name, args } => {
+                if function(name).is_some_and(|f| f.volatile) {
+                    return true;
+                }
+                stack.extend(args);
+            }
+            Expr::Unary { expr, .. } => stack.push(expr),
+            Expr::Binary { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Replaces function calls that give the same single value in every row with that value,
+/// so `[@Qty]/SUM([Qty])` sums once per pass instead of once per row. Calls returning a
+/// range, a date, or an empty value are left alone: they have no literal form.
+fn hoist(expr: &mut Expr, ctx: &dyn Context) {
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        if matches!(e, Expr::Call { .. }) && !varies_by_row(e) {
+            let literal = match eval_arg(e, ctx) {
+                Arg::Value(v) | Arg::Ref(v) => match v {
+                    Value::Number(n) => Some(Expr::Number(n)),
+                    Value::Text(s) => Some(Expr::Text(s)),
+                    Value::Bool(b) => Some(Expr::Bool(b)),
+                    Value::Error(k) => Some(Expr::Error(k)),
+                    Value::Date(_) | Value::Empty => None,
+                },
+                Arg::Range(_) => None,
+            };
+            if let Some(literal) = literal {
+                *e = literal;
+                continue;
+            }
+        }
+        match e {
+            Expr::Unary { expr, .. } => stack.push(expr),
+            Expr::Binary { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::Call { args, .. } => stack.extend(args.iter_mut()),
+            _ => {}
+        }
+    }
 }
 
 /// One row's values by lower-cased column name, and whole columns a formula reads.
@@ -222,10 +354,7 @@ impl RowContext<'_> {
 impl Context for RowContext<'_> {
     fn this_row(&self, table: Option<&str>, column: &str) -> std::result::Result<Value, ErrorKind> {
         self.own(table)?;
-        self.row
-            .get(&column.to_ascii_lowercase())
-            .cloned()
-            .ok_or(ErrorKind::Ref)
+        self.row.get(&lower(column)).cloned().ok_or(ErrorKind::Ref)
     }
 
     fn column(
@@ -235,58 +364,76 @@ impl Context for RowContext<'_> {
     ) -> std::result::Result<Cow<'_, [Value]>, ErrorKind> {
         self.own(table)?;
         self.columns
-            .get(&column.to_ascii_lowercase())
+            .get(&lower(column))
             .map(|v| Cow::Borrowed(v.as_slice()))
             .ok_or(ErrorKind::Ref)
     }
 }
 
-/// Evaluates one formula column for `scope` and writes the results.
-fn compute(conn: &Connection, t: &Table, f: &Formula, scope: &Scope) -> Result<()> {
+/// Evaluates one formula column for every row, or for `rows`, and writes the results.
+/// Returns whether the column now holds dates.
+fn compute(
+    conn: &Connection,
+    t: &Table,
+    f: &Formula<'_>,
+    rows: Option<&BTreeSet<i64>>,
+    dates: &HashMap<ColumnId, bool>,
+) -> Result<bool> {
+    let is_dates = |c: &Column| dates.get(&c.id).copied().unwrap_or(c.formula_dates);
     let id = quote(ROW_ID);
-    let target = quote(&f.name);
+    let target = quote(&f.column.name);
     let tname = quote(&t.name);
-    let Some(expr) = &f.expr else {
-        return fill(conn, t, &f.name, &Value::Error(ErrorKind::Name));
+    let Some(parsed) = &f.expr else {
+        fill(conn, t, &f.column.name, &Value::Error(ErrorKind::Name))?;
+        return Ok(false);
     };
 
     let mut columns = HashMap::new();
     for name in &f.whole {
-        if let Some(col) = t
-            .columns
-            .iter()
-            .find(|c| c.name.to_ascii_lowercase() == *name)
-        {
+        if let Some(col) = t.columns.iter().find(|c| lower(&c.name) == *name) {
             let sql = format!("SELECT {} FROM {tname} ORDER BY {id}", quote(&col.name));
             let mut stmt = conn.prepare(&sql)?;
             let values = stmt
-                .query_map([], |r| Ok(formula_value(col.ty, r.get_ref(0)?)))?
+                .query_map([], |r| {
+                    Ok(formula_value(col.ty, is_dates(col), r.get_ref(0)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             columns.insert(name.clone(), values);
         }
     }
+    let no_row = HashMap::new();
+    let mut expr = parsed.clone();
+    hoist(
+        &mut expr,
+        &RowContext {
+            table: &t.name,
+            row: &no_row,
+            columns: &columns,
+        },
+    );
 
-    let readable: Vec<_> = t
+    let readable: Vec<&Column> = t
         .columns
         .iter()
-        .filter(|c| f.this_row.contains(&c.name.to_ascii_lowercase()))
+        .filter(|c| f.this_row.contains(&lower(&c.name)))
         .collect();
     let list: Vec<String> = std::iter::once(id.clone())
         .chain(readable.iter().map(|c| quote(&c.name)))
         .collect();
     let select = format!("SELECT {} FROM {tname}", list.join(", "));
-    let mut read = conn.prepare(&match scope {
-        Scope::All => format!("{select} ORDER BY {id}"),
-        Scope::Rows(_) => format!("{select} WHERE {id} = ?1"),
+    let mut read = conn.prepare(&match rows {
+        None => format!("{select} ORDER BY {id}"),
+        Some(_) => format!("{select} WHERE {id} = ?1"),
     })?;
     let mut write = conn.prepare(&format!("UPDATE {tname} SET {target} = ?1 WHERE {id} = ?2"))?;
+    let mut kinds = Kinds::default();
     let mut eval_row = |r: &rusqlite::Row<'_>| -> Result<()> {
         let row_id: i64 = r.get(0)?;
         let mut row = HashMap::with_capacity(readable.len());
         for (i, c) in readable.iter().enumerate() {
             row.insert(
-                c.name.to_ascii_lowercase(),
-                formula_value(c.ty, r.get_ref(i + 1)?),
+                lower(&c.name),
+                formula_value(c.ty, is_dates(c), r.get_ref(i + 1)?),
             );
         }
         let ctx = RowContext {
@@ -294,26 +441,62 @@ fn compute(conn: &Connection, t: &Table, f: &Formula, scope: &Scope) -> Result<(
             row: &row,
             columns: &columns,
         };
-        write.execute(rusqlite::params![stored(&evaluate(expr, &ctx)), row_id])?;
+        let value = evaluate(&expr, &ctx);
+        kinds.see(&value);
+        write.execute(rusqlite::params![stored(&value), row_id])?;
         Ok(())
     };
-    match scope {
-        Scope::All => {
-            let mut rows = read.query([])?;
-            while let Some(r) = rows.next()? {
+    match rows {
+        None => {
+            let mut all = read.query([])?;
+            while let Some(r) = all.next()? {
                 eval_row(r)?;
             }
         }
-        Scope::Rows(ids) => {
+        Some(ids) => {
             for row_id in ids {
-                let mut rows = read.query([row_id])?;
-                if let Some(r) = rows.next()? {
+                let mut one = read.query([row_id])?;
+                if let Some(r) = one.next()? {
                     eval_row(r)?;
                 }
             }
         }
     }
-    Ok(())
+    kinds.record(conn, f.column, is_dates(f.column), rows.is_none())
+}
+
+/// What kinds of results a pass produced, to decide whether the column holds dates.
+#[derive(Default)]
+struct Kinds {
+    dates: bool,
+    others: bool,
+}
+
+impl Kinds {
+    fn see(&mut self, v: &Value) {
+        match v {
+            Value::Date(_) => self.dates = true,
+            Value::Empty | Value::Error(_) => {}
+            _ => self.others = true,
+        }
+    }
+
+    /// A column holds dates when every non-blank, non-error result is a date. A partial
+    /// pass sees only some rows, so it can only take that away; a full pass decides afresh.
+    fn record(&self, conn: &Connection, column: &Column, was: bool, full: bool) -> Result<bool> {
+        let dates = if full {
+            self.dates && !self.others
+        } else {
+            was && !self.others
+        };
+        if dates != was {
+            conn.execute(
+                "UPDATE xel_columns SET formula_kind = ?1 WHERE id = ?2",
+                rusqlite::params![dates.then_some("date"), column.id.0],
+            )?;
+        }
+        Ok(dates)
+    }
 }
 
 /// Writes one value into every row of a formula column.
@@ -326,7 +509,8 @@ fn fill(conn: &Connection, t: &Table, column: &str, value: &Value) -> Result<()>
 }
 
 /// A stored cell as a formula sees it.
-pub(crate) fn formula_value(ty: ColumnType, raw: ValueRef<'_>) -> Value {
+/// `dates` says whether a formula column's results are dates.
+pub(crate) fn formula_value(ty: ColumnType, dates: bool, raw: ValueRef<'_>) -> Value {
     match (ty, raw) {
         (_, ValueRef::Null) => Value::Empty,
         (ColumnType::Checkbox | ColumnType::Formula, ValueRef::Integer(i)) => Value::Bool(i != 0),
@@ -336,8 +520,10 @@ pub(crate) fn formula_value(ty: ColumnType, raw: ValueRef<'_>) -> Value {
             .map_or(Value::Error(ErrorKind::Value), Value::Date),
         (ColumnType::Formula, ValueRef::Text(t)) => {
             let s = String::from_utf8_lossy(t);
-            // Dates are stored as ISO text (see `stored`); other text is text.
-            serial_from_iso(&s).map_or_else(|| Value::Text(s.into_owned()), Value::Date)
+            // Only a column whose results are dates reads its ISO text as dates; text that
+            // merely looks like a date stays text.
+            let date = dates.then(|| serial_from_date_text(&s)).flatten();
+            date.map_or_else(|| Value::Text(s.into_owned()), Value::Date)
         }
         (ColumnType::Formula, ValueRef::Blob(b)) => Value::Error(error_from(b)),
         (_, ValueRef::Real(n)) => Value::Number(n),
@@ -354,18 +540,48 @@ pub(crate) fn formula_value(ty: ColumnType, raw: ValueRef<'_>) -> Value {
     }
 }
 
+/// `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`, as `stored` writes dates.
+fn serial_from_date_text(s: &str) -> Option<f64> {
+    let day = serial_from_iso(s.get(..10)?)?;
+    match s.get(10..) {
+        Some("") => Some(day),
+        Some(rest) => Some(day + number_from_text(rest.strip_prefix(' ')?)?),
+        None => None,
+    }
+}
+
 /// A formula result as stored in its `ANY` column: numbers as `REAL`, booleans as 0/1,
-/// text as `TEXT`, dates as ISO `TEXT`, and errors as a `BLOB` of their text, so an error
-/// is never mistaken for text that happens to read `#DIV/0!`.
+/// text as `TEXT`, dates as ISO `TEXT` (with the time when there is one), and errors as a
+/// `BLOB` of their text, so an error is never mistaken for text reading `#DIV/0!`.
 pub(crate) fn stored(value: &Value) -> SqlValue {
     match value {
         Value::Empty => SqlValue::Null,
         Value::Number(n) => SqlValue::Real(*n),
         Value::Bool(b) => SqlValue::Integer(i64::from(*b)),
         Value::Text(s) => SqlValue::Text(s.clone()),
-        Value::Date(d) => iso_from_serial(*d).map_or(SqlValue::Real(*d), SqlValue::Text),
+        Value::Date(d) => match iso_from_serial(*d) {
+            Some(day) if d.fract() == 0.0 => SqlValue::Text(day),
+            Some(day) => SqlValue::Text(format!("{day} {}", time_of_day(*d))),
+            None => SqlValue::Real(*d),
+        },
         Value::Error(e) => SqlValue::Blob(e.as_str().as_bytes().to_vec()),
     }
+}
+
+/// The time part of a serial, as `HH:MM:SS`, rounded to the second.
+fn time_of_day(serial: f64) -> String {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a fraction of one day"
+    )]
+    let seconds = (serial.fract() * 86_400.0).round().min(86_399.0) as u32;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
 }
 
 /// The error a stored `BLOB` names; unknown bytes read as `#VALUE!`.
@@ -603,6 +819,79 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(&class, storage, "{formula}");
+        }
+    }
+
+    #[test]
+    fn date_looking_text_stays_text_and_dates_keep_their_time() {
+        let dir = TempDir::new();
+        let mut book = Workbook::create(dir.path().join("book.xel")).unwrap();
+        let t = book
+            .create_table(
+                "T",
+                &[("Code", ColumnType::Text), ("Due", ColumnType::Date)],
+            )
+            .unwrap();
+        let cols = book.table(t).unwrap().columns;
+        book.insert_row(
+            t,
+            &[
+                (cols[0].id, CellValue::Text("2024-01-31".into())),
+                (cols[1].id, CellValue::Date(Date::new(2024, 1, 31).unwrap())),
+            ],
+        )
+        .unwrap();
+        let echo = book.add_formula_column(t, "Echo", "=[@Code]").unwrap();
+        assert_eq!(
+            column(&book, t, echo),
+            [CellValue::Text("2024-01-31".into())]
+        );
+        let compared = book
+            .add_formula_column(t, "Same", "=[@Echo]=\"2024-01-31\"")
+            .unwrap();
+        assert_eq!(column(&book, t, compared), [CellValue::Checkbox(true)]);
+        let noon = book.add_formula_column(t, "Noon", "=[@Due]+0.5").unwrap();
+        let back = book
+            .add_formula_column(t, "Back", "=[@Noon]-[@Due]")
+            .unwrap();
+        assert_eq!(
+            column(&book, t, back),
+            [n(0.5)],
+            "the time survived storage"
+        );
+        let next = book.add_formula_column(t, "Next", "=[@Due]+1").unwrap();
+        assert_eq!(
+            column(&book, t, next),
+            [CellValue::Date(Date::new(2024, 2, 1).unwrap())]
+        );
+        assert!(matches!(column(&book, t, noon)[0], CellValue::Date(_)));
+    }
+
+    /// A share-of-total formula over 100,000 rows, recomputed after one cell edit. Run with
+    /// `cargo test --release -p xel-engine share_of_total_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn share_of_total_benchmark() {
+        let mut o = orders();
+        o.book
+            .conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000) \
+                 INSERT INTO Orders (Qty, Price) SELECT i % 97, 1 FROM n;",
+            )
+            .unwrap();
+        o.book
+            .add_formula_column(o.t, "Share", "=[@Qty]/SUM([Qty])")
+            .unwrap();
+        let start = std::time::Instant::now();
+        o.book.set_cell(o.qty, o.rows[0], &n(5.0)).unwrap();
+        let elapsed = start.elapsed();
+        eprintln!("one edit with a share-of-total column over 100,002 rows: {elapsed:?}");
+        if !cfg!(debug_assertions) {
+            assert!(
+                elapsed < std::time::Duration::from_millis(500),
+                "{elapsed:?}"
+            );
         }
     }
 
