@@ -75,9 +75,9 @@ Workbooks become relational: tables link to each other, SQL query blocks compute
 
 ## v0.3 — The Excel bridge
 
-`··········` 0% · 0 of 15 done · due 2027-06-30
+`··········` 0% · 0 of 18 done · due 2027-08-15
 
-xel works alongside Excel: open an .xlsx, keep working in typed tables, export back to .xlsx with a report of anything that became static, and copy and paste formulas between the two.
+xel works alongside Excel: open an .xlsx, keep working in typed tables, summarize with pivot tables, export back to .xlsx with a report of anything that became static, and copy and paste formulas between the two.
 
 ### backlog
 
@@ -96,12 +96,15 @@ xel works alongside Excel: open an .xlsx, keep working in typed tables, export b
 - [ ] [`0072`](https://github.com/oddurs/xel/blob/main/cairn/items/0072-let-and-lambda-named-functions.md) LET and LAMBDA named functions <sup>feature · p1 · formula</sup>
 - [ ] [`0073`](https://github.com/oddurs/xel/blob/main/cairn/items/0073-conditional-formatting.md) Conditional formatting <sup>feature · p1 · grid</sup>
 - [ ] [`0074`](https://github.com/oddurs/xel/blob/main/cairn/items/0074-locale-aware-number-entry-and-formula-separators.md) Locale-aware number entry and formula separators <sup>feature · p1 · formula</sup>
+- [ ] [`0109`](https://github.com/oddurs/xel/blob/main/cairn/items/0109-pivot-tables-over-tables-and-views.md) Pivot tables over tables and views <sup>feature · p0 · query</sup>
+- [ ] [`0110`](https://github.com/oddurs/xel/blob/main/cairn/items/0110-pivot-field-wells-and-layout.md) Pivot field wells and layout <sup>feature · p0 · app</sup>
+- [ ] [`0111`](https://github.com/oddurs/xel/blob/main/cairn/items/0111-pivot-tables-in-xlsx-import-and-export.md) Pivot tables in xlsx import and export <sup>feature · p1 · interop</sup>
 
-## v0.4 — Python and provenance
+## v0.4 — Python, charts, and provenance
 
-`··········` 0% · 0 of 15 done · due 2027-09-15
+`··········` 0% · 0 of 21 done · due 2027-11-15
 
-xel becomes a development environment: Python blocks run inside workbooks behind a trust prompt, the `xel` Python package scripts workbooks from outside, and every value can be traced to its sources and compared across versions.
+xel becomes a development environment with charts: Python blocks run inside workbooks behind a trust prompt, charts update live from tables, queries, and pivots, the `xel` Python package scripts workbooks from outside, and every value can be traced to its sources and compared across versions.
 
 ### backlog
 
@@ -120,12 +123,18 @@ xel becomes a development environment: Python blocks run inside workbooks behind
 - [ ] [`0087`](https://github.com/oddurs/xel/blob/main/cairn/items/0087-text-sidecar-for-formulas-queries-and-scripts.md) Text sidecar for formulas, queries, and scripts <sup>feature · p2 · format</sup>
 - [ ] [`0088`](https://github.com/oddurs/xel/blob/main/cairn/items/0088-command-palette.md) Command palette <sup>feature · p1 · app</sup>
 - [ ] [`0089`](https://github.com/oddurs/xel/blob/main/cairn/items/0089-column-profiles-in-headers.md) Column profiles in headers <sup>feature · p2 · grid</sup>
+- [ ] [`0112`](https://github.com/oddurs/xel/blob/main/cairn/items/0112-can-swift-charts-carry-xel-s-charts.md) Can Swift Charts carry xel's charts? <sup>spike · p0 · app</sup>
+- [ ] [`0113`](https://github.com/oddurs/xel/blob/main/cairn/items/0113-chart-definitions-in-the-workbook.md) Chart definitions in the workbook <sup>feature · p0 · format</sup>
+- [ ] [`0114`](https://github.com/oddurs/xel/blob/main/cairn/items/0114-insert-and-edit-charts.md) Insert and edit charts <sup>feature · p0 · app</sup>
+- [ ] [`0115`](https://github.com/oddurs/xel/blob/main/cairn/items/0115-chart-axes-legends-labels-and-colors.md) Chart axes, legends, labels, and colors <sup>feature · p1 · app</sup>
+- [ ] [`0116`](https://github.com/oddurs/xel/blob/main/cairn/items/0116-copy-and-export-charts-as-images-and-pdf.md) Copy and export charts as images and PDF <sup>feature · p2 · app</sup>
+- [ ] [`0117`](https://github.com/oddurs/xel/blob/main/cairn/items/0117-charts-in-xlsx-import-and-export.md) Charts in xlsx import and export <sup>feature · p1 · interop</sup>
 
 ## v1.0 — The promise
 
-`··········` 0% · 0 of 11 done · due 2027-11-30
+`··········` 0% · 0 of 10 done · due 2028-01-31
 
-The promise: an Excel user can open an .xlsx in xel, work with it as typed, linked tables using Excel formulas, SQL, and Python, and save a .xel file any SQLite tool can read, with a file format and Python API that will not break without a major version.
+The promise: an Excel user can open an .xlsx in xel, work with it as typed, linked tables using Excel formulas, SQL, Python, pivot tables, and charts, and save a .xel file any SQLite tool can read, with a file format and Python API that will not break without a major version.
 
 ### backlog
 
@@ -135,7 +144,6 @@ The promise: an Excel user can open an .xlsx in xel, work with it as typed, link
 - [ ] [`0093`](https://github.com/oddurs/xel/blob/main/cairn/items/0093-fuzzing-and-crash-safety-suite.md) Fuzzing and crash-safety suite <sup>chore · p0 · format</sup>
 - [ ] [`0094`](https://github.com/oddurs/xel/blob/main/cairn/items/0094-accessibility-audit-and-fixes.md) Accessibility audit and fixes <sup>chore · p0 · app</sup>
 - [ ] [`0095`](https://github.com/oddurs/xel/blob/main/cairn/items/0095-homebrew-cask-and-automatic-updates.md) Homebrew cask and automatic updates <sup>chore · p0 · infra</sup>
-- [ ] [`0096`](https://github.com/oddurs/xel/blob/main/cairn/items/0096-decide-whether-to-ship-in-the-mac-app-store.md) Decide whether to ship in the Mac App Store <sup>spike · p1 · infra</sup>
 - [ ] [`0097`](https://github.com/oddurs/xel/blob/main/cairn/items/0097-user-guide.md) User guide <sup>docs · p0 · docs</sup>
 - [ ] [`0098`](https://github.com/oddurs/xel/blob/main/cairn/items/0098-function-reference-generated-from-the-registry.md) Function reference generated from the registry <sup>docs · p0 · docs</sup>
 - [ ] [`0099`](https://github.com/oddurs/xel/blob/main/cairn/items/0099-architecture-guide-for-contributors.md) Architecture guide for contributors <sup>docs · p1 · docs</sup>
@@ -143,14 +151,13 @@ The promise: an Excel user can open an .xlsx in xel, work with it as typed, link
 
 ## later — Not on the path to 1.0
 
-`··········` 0% · 0 of 8 done
+`··········` 0% · 0 of 7 done
 
 Good ideas that are not on the path to 1.0. Items wait here instead of being argued about.
 
 ### backlog
 
-- [ ] [`0101`](https://github.com/oddurs/xel/blob/main/cairn/items/0101-charts.md) Charts <sup>feature · p2 · app</sup>
-- [ ] [`0102`](https://github.com/oddurs/xel/blob/main/cairn/items/0102-pivot-tables.md) Pivot tables <sup>feature · p2 · query</sup>
+- [ ] [`0096`](https://github.com/oddurs/xel/blob/main/cairn/items/0096-decide-whether-to-ship-in-the-mac-app-store.md) Decide whether to ship in the Mac App Store <sup>spike · p3 · infra</sup>
 - [ ] [`0103`](https://github.com/oddurs/xel/blob/main/cairn/items/0103-kanban-calendar-gallery-and-form-views.md) Kanban, calendar, gallery, and form views <sup>feature · p2 · app</sup>
 - [ ] [`0104`](https://github.com/oddurs/xel/blob/main/cairn/items/0104-how-could-xel-support-collaboration.md) How could xel support collaboration? <sup>spike · p2 · format</sup>
 - [ ] [`0105`](https://github.com/oddurs/xel/blob/main/cairn/items/0105-which-platform-comes-after-macos.md) Which platform comes after macOS? <sup>spike · p3 · app</sup>

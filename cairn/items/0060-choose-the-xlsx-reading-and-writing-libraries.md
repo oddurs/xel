@@ -14,7 +14,7 @@ area: interop
 
 ## Question
 
-Which Rust crates read formulas, styles, Excel Tables, and defined names, and write Excel Tables with structured references: calamine plus rust_xlsxwriter, umya-spreadsheet, or our own reader?
+Which Rust crates read formulas, styles, Excel Tables, defined names, PivotTables, and charts, and write Excel Tables with structured references, PivotTables, and charts: calamine plus rust_xlsxwriter, umya-spreadsheet, or our own reader?
 
 ## Why it matters
 

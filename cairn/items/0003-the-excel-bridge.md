@@ -8,12 +8,12 @@ status: backlog
 created: 2026-11-01
 updated: 2026-11-01
 priority: p2
-due: 2027-06-30
+due: 2027-08-15
 ---
 
 ## Ships
 
-xel works alongside Excel: open an .xlsx, keep working in typed tables, export back to .xlsx with a report of anything that became static, and copy and paste formulas between the two.
+xel works alongside Excel: open an .xlsx, keep working in typed tables, summarize with pivot tables, export back to .xlsx with a report of anything that became static, and copy and paste formulas between the two.
 
 ## Done when
 
@@ -22,5 +22,5 @@ xel works alongside Excel: open an .xlsx, keep working in typed tables, export b
 
 ## Explicitly not in this milestone
 
-- Charts and pivot tables (out of scope for 1.0)
+- Charts (v0.4)
 - VBA macros (never; they are preserved as an attachment at most)

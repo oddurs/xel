@@ -4,12 +4,12 @@ uid: 864500c3-d181-484c-a767-eb328b49ba39
 title: Decide whether to ship in the Mac App Store
 type: spike
 status: backlog
-milestone: v1.0
+milestone: later
 depends_on:
 - 79
 created: 2026-11-01
 updated: 2026-11-01
-priority: p1
+priority: p3
 effort: s
 area: infra
 ---

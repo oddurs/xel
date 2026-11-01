@@ -8,6 +8,8 @@ milestone: v1.0
 depends_on:
 - 68
 - 79
+- 110
+- 114
 created: 2026-11-01
 updated: 2026-11-01
 priority: p0
@@ -21,7 +23,7 @@ A 1.0 needs documentation a stranger can learn from.
 
 ## Proposal
 
-Write getting started, an Excel user's guide (what maps to what), linked tables and views, SQL query blocks, and Python blocks, published from docs/.
+Write getting started, an Excel user's guide (what maps to what), linked tables and views, SQL query blocks, pivot tables, charts, and Python blocks, published from docs/.
 
 ## Acceptance criteria
 

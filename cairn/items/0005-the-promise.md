@@ -8,12 +8,12 @@ status: backlog
 created: 2026-11-01
 updated: 2026-11-01
 priority: p2
-due: 2027-11-30
+due: 2028-01-31
 ---
 
 ## Ships
 
-The promise: an Excel user can open an .xlsx in xel, work with it as typed, linked tables using Excel formulas, SQL, and Python, and save a .xel file any SQLite tool can read, with a file format and Python API that will not break without a major version.
+The promise: an Excel user can open an .xlsx in xel, work with it as typed, linked tables using Excel formulas, SQL, Python, pivot tables, and charts, and save a .xel file any SQLite tool can read, with a file format and Python API that will not break without a major version.
 
 ## Done when
 
@@ -24,6 +24,6 @@ The promise: an Excel user can open an .xlsx in xel, work with it as typed, link
 
 ## Explicitly not in this milestone
 
-- Charts and pivot tables
 - Real-time collaboration
 - Platforms other than macOS
+- The Mac App Store (distribution is a notarized download and Homebrew)
