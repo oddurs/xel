@@ -19,7 +19,8 @@ GitHub; the `pre-push` hook enforces it locally.
 2. Work in that worktree. Never share a checkout between two tasks or two agents.
 3. Commit with `scripts/agent commit "<message>"`.
 4. `scripts/agent sync` rebases onto `main` when it moves.
-5. `scripts/agent pr` runs the full check, pushes, and opens the pull request.
+5. `scripts/agent pr --body-file <path>` runs the full check, pushes, and opens the
+   pull request. Without `--body-file` the body is the empty template; fill it in.
 6. After the squash merge, `scripts/agent done` removes the worktree and branch.
 
 ## Commits
