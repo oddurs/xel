@@ -1,9 +1,11 @@
 // swift-tools-version: 6.2
 import PackageDescription
 
-/// Where cargo puts the engine's static library. `scripts/task build` builds it and
-/// generates the Swift bindings under Generated/ before building this package.
-let engineLibraries = "\(Context.packageDirectory)/../target/debug"
+/// Where cargo put the engine's static library. `scripts/task build` builds it, generates
+/// the Swift bindings under Generated/, and passes this directory, which follows
+/// CARGO_TARGET_DIR and the build profile.
+let engineLibraries =
+    Context.environment["XEL_ENGINE_LIB_DIR"] ?? "\(Context.packageDirectory)/../target/debug"
 
 let package = Package(
     name: "Xel",

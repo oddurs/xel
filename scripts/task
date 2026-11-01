@@ -6,18 +6,32 @@ cd "$(dirname "$0")/.."
 
 SWIFT_SOURCES="app/Package.swift app/Sources"
 
+# Where cargo writes the engine's static library: honours CARGO_TARGET_DIR and the
+# profile (XEL_PROFILE=release for release builds; debug otherwise).
+engine_lib_dir() {
+    target=$(cargo metadata --format-version 1 --no-deps |
+        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    echo "$target/${XEL_PROFILE:-debug}"
+}
+
 # Generates the Swift bindings for the engine from the built static library. SwiftPM
-# needs them laid out as a C module (header and module map) and a Swift target.
+# needs them laid out as a C module (header and module map) and a Swift target. Files are
+# replaced only when they change, so SwiftPM does not recompile them on every build.
 bindings() {
+    lib=$(engine_lib_dir)/libxel_ffi.a
     out=app/Generated
-    tmp=$out/.uniffi
-    rm -rf "$out"
-    mkdir -p "$tmp" "$out/xel_ffiFFI" "$out/XelEngine"
-    cargo run --quiet --locked -p uniffi-bindgen -- generate \
-        --library target/debug/libxel_ffi.a --language swift --out-dir "$tmp"
-    mv "$tmp/xel_ffiFFI.h" "$out/xel_ffiFFI/"
-    mv "$tmp/xel_ffiFFI.modulemap" "$out/xel_ffiFFI/module.modulemap"
-    mv "$tmp/xel_ffi.swift" "$out/XelEngine/"
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/xel-bindings.XXXXXX")
+    cargo run --quiet --locked --manifest-path tools/uniffi-bindgen/Cargo.toml -- \
+        generate --library "$lib" --language swift --out-dir "$tmp"
+    mkdir -p "$out/xel_ffiFFI" "$out/XelEngine"
+    place() {
+        if ! cmp -s "$1" "$2"; then
+            cp "$1" "$2"
+        fi
+    }
+    place "$tmp/xel_ffiFFI.h" "$out/xel_ffiFFI/xel_ffiFFI.h"
+    place "$tmp/xel_ffiFFI.modulemap" "$out/xel_ffiFFI/module.modulemap"
+    place "$tmp/xel_ffi.swift" "$out/XelEngine/xel_ffi.swift"
     rm -rf "$tmp"
 }
 
@@ -53,9 +67,15 @@ run() {
             cargo test --workspace --locked
             ;;
         build)
-            cargo build --workspace --locked
+            profile_flag=""
+            if [ "${XEL_PROFILE:-debug}" = release ]; then
+                profile_flag="--release"
+            fi
+            cargo build --workspace --locked $profile_flag
             bindings
-            swift build --package-path app -Xswiftc -warnings-as-errors
+            XEL_ENGINE_LIB_DIR=$(engine_lib_dir) \
+                swift build --package-path app -Xswiftc -warnings-as-errors \
+                -c "${XEL_PROFILE:-debug}"
             ;;
         check)
             run fmt:check
