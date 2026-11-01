@@ -1,0 +1,31 @@
+#!/bin/sh
+# Enforce Conventional Commits and keep tool attribution out of history.
+set -eu
+
+msg_file=$1
+subject=$(grep -v '^#' "$msg_file" | head -n 1)
+
+case "$subject" in
+    "Merge "* | "Revert "* | "fixup! "* | "squash! "*) exit 0 ;;
+esac
+
+if ! printf '%s\n' "$subject" |
+    grep -Eq '^(feat|fix|chore|docs|perf|refactor|test|build|ci|style|revert)(\([a-z0-9._/-]+\))?!?: [^ ].*[^.]$'; then
+    cat >&2 <<MSG
+commit-msg: not a Conventional Commit subject:
+  $subject
+expected: type(scope)!: subject   (type: feat fix chore docs perf refactor test build ci style revert)
+MSG
+    exit 1
+fi
+
+if [ "${#subject}" -gt 72 ]; then
+    echo "commit-msg: subject is ${#subject} characters; the limit is 72" >&2
+    exit 1
+fi
+
+if grep -v '^#' "$msg_file" |
+    grep -Eiq '^co-authored-by:.*(claude|anthropic|copilot|openai|chatgpt|gemini|cursor|\[bot\])|generated (with|by) |🤖'; then
+    echo "commit-msg: remove tool attribution lines from the message" >&2
+    exit 1
+fi

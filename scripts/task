@@ -1,0 +1,58 @@
+#!/bin/sh
+# The only interface CI, git hooks, and scripts/agent use to talk to the toolchains.
+set -eu
+
+cd "$(dirname "$0")/.."
+
+SWIFT_SOURCES="app/Package.swift app/Sources"
+
+swift_fmt_check() {
+    # swift-format has no --check mode; diff each file against its formatted output.
+    drift=0
+    for f in $(find $SWIFT_SOURCES -name '*.swift'); do
+        if ! swift format "$f" | diff -q "$f" - >/dev/null; then
+            echo "needs formatting: $f" >&2
+            drift=1
+        fi
+    done
+    return "$drift"
+}
+
+run() {
+    case "$1" in
+        fmt)
+            cargo fmt --all
+            swift format --in-place --recursive $SWIFT_SOURCES
+            ;;
+        fmt:check)
+            cargo fmt --all --check
+            swift_fmt_check
+            ;;
+        lint)
+            cargo clippy --workspace --all-targets --locked -- -D warnings
+            swift format lint --strict --recursive $SWIFT_SOURCES
+            ;;
+        test)
+            # The Swift app has no tests yet; XCTest needs full Xcode, so Swift tests
+            # arrive with the first app logic worth testing.
+            cargo test --workspace --locked
+            ;;
+        build)
+            cargo build --workspace --locked
+            swift build --package-path app -Xswiftc -warnings-as-errors
+            ;;
+        check)
+            run fmt:check
+            run lint
+            run test
+            run build
+            ;;
+        *)
+            echo "usage: scripts/task {fmt|fmt:check|lint|test|build|check}" >&2
+            exit 2
+            ;;
+    esac
+}
+
+[ $# -eq 1 ] || run usage
+run "$1"

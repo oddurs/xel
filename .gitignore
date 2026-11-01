@@ -1,0 +1,18 @@
+# Rust
+/target/
+
+# Swift
+/app/.build/
+/app/.swiftpm/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+
+# Worktrees, if created inside the repo by mistake
+.worktrees/
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
+*.swp

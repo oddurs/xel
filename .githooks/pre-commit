@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fast gate: formatting and lint. The full suite runs in pre-push.
+set -eu
+root=$(git rev-parse --show-toplevel)
+"$root/scripts/task" fmt:check
+"$root/scripts/task" lint

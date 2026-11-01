@@ -1,0 +1,19 @@
+#!/bin/sh
+# Refuse pushes to the default branch; it advances only through merged pull requests.
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+if ref=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null); then
+    default=${ref#origin/}
+else
+    default=main
+fi
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    if [ "$remote_ref" = "refs/heads/$default" ]; then
+        echo "pre-push: refusing to push to $default; open a pull request instead (scripts/agent pr)" >&2
+        exit 1
+    fi
+done
+
+"$root/scripts/task" check

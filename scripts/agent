@@ -1,0 +1,189 @@
+#!/bin/sh
+# One unit of work -> one worktree -> one branch -> one pull request.
+set -eu
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "agent: not inside a git repository" >&2
+    exit 1
+}
+# The primary checkout, even when invoked from inside a worktree.
+PRIMARY=$(dirname "$(cd "$ROOT" && git rev-parse --path-format=absolute --git-common-dir)")
+REPO=$(basename "$PRIMARY")
+WORKTREES=$(dirname "$PRIMARY")/.worktrees/$REPO
+BRANCH_RE='^(feat|fix|chore|docs|perf|refactor|test)/[a-z0-9][a-z0-9._-]*$'
+COMMIT_RE='^(feat|fix|chore|docs|perf|refactor|test|build|ci|style|revert)(\([a-z0-9._/-]+\))?!?: [^ ].*[^.]$'
+
+say() { printf '==> %s\n' "$*"; }
+die() {
+    printf 'agent: %s\n' "$*" >&2
+    exit 1
+}
+
+default_branch() {
+    if ref=$(git -C "$PRIMARY" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null); then
+        echo "${ref#origin/}"
+    else
+        (cd "$PRIMARY" && gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)
+    fi
+}
+
+current_branch() { git -C "$ROOT" symbolic-ref --quiet --short HEAD || die "detached HEAD"; }
+
+cmd_doctor() {
+    problems=0
+    problem() {
+        printf '  x %s\n' "$*" >&2
+        problems=$((problems + 1))
+    }
+    ok() { printf '  ok %s\n' "$*"; }
+
+    for tool in git gh cargo rustup swift; do
+        if command -v "$tool" >/dev/null 2>&1; then ok "$tool"; else problem "$tool not found on PATH"; fi
+    done
+    if gh auth status >/dev/null 2>&1; then ok "gh authenticated"; else problem "gh not authenticated: run 'gh auth login'"; fi
+    if command -v rustup >/dev/null 2>&1; then
+        if (cd "$PRIMARY" && rustup show active-toolchain >/dev/null 2>&1); then
+            ok "rust toolchain $(cd "$PRIMARY" && rustup show active-toolchain | cut -d' ' -f1)"
+        else
+            problem "pinned rust toolchain missing: run 'rustup toolchain install' in $PRIMARY"
+        fi
+    fi
+    if command -v swift >/dev/null 2>&1 && ! swift format --version >/dev/null 2>&1; then
+        problem "swift format unavailable: install Swift 6 or Xcode 16+"
+    fi
+
+    # An unset key exits 1; that case is handled below by setting it.
+    hooks=$(git -C "$PRIMARY" config --get core.hooksPath) || hooks=""
+    if [ "$hooks" != ".githooks" ]; then
+        git -C "$PRIMARY" config core.hooksPath .githooks
+        ok "set core.hooksPath to .githooks"
+    else
+        ok "hooks path .githooks"
+    fi
+    if git -C "$PRIMARY" remote get-url origin >/dev/null 2>&1; then
+        ok "origin $(git -C "$PRIMARY" remote get-url origin)"
+        if git -C "$PRIMARY" remote set-head origin --auto >/dev/null 2>&1; then
+            ok "default branch $(default_branch)"
+        else
+            problem "cannot resolve origin's default branch (offline?)"
+        fi
+    else
+        problem "no 'origin' remote"
+    fi
+    if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+        problem "working tree at $ROOT has uncommitted changes"
+    else
+        ok "clean working tree"
+    fi
+
+    [ "$problems" -eq 0 ] || die "$problems problem(s) found"
+    say "doctor: all good"
+}
+
+cmd_start() {
+    [ $# -eq 1 ] || die "usage: scripts/agent start <type>/<slug>"
+    branch=$1
+    echo "$branch" | grep -Eq "$BRANCH_RE" ||
+        die "branch '$branch' must match <type>/<slug>, type in feat fix chore docs perf refactor test"
+    path=$WORKTREES/$branch
+    git -C "$PRIMARY" show-ref --verify --quiet "refs/heads/$branch" && die "branch '$branch' already exists"
+    [ -e "$path" ] && die "worktree path already exists: $path"
+
+    base=$(default_branch)
+    say "fetching origin"
+    git -C "$PRIMARY" fetch --quiet origin
+    say "creating $branch from origin/$base at $path"
+    mkdir -p "$(dirname "$path")"
+    # --no-track: a bare 'git push' must never target the default branch.
+    git -C "$PRIMARY" worktree add --quiet --no-track -b "$branch" "$path" "origin/$base"
+    say "ready: cd $path"
+}
+
+cmd_check() {
+    say "scripts/task check"
+    "$ROOT/scripts/task" check
+}
+
+cmd_commit() {
+    [ $# -ge 1 ] || die "usage: scripts/agent commit <message>"
+    msg=$*
+    subject=$(printf '%s\n' "$msg" | head -n 1)
+    printf '%s\n' "$subject" | grep -Eq "$COMMIT_RE" ||
+        die "not a Conventional Commit subject: '$subject'"
+    [ "${#subject}" -le 72 ] || die "subject is ${#subject} characters; the limit is 72"
+    say "committing: $subject"
+    git -C "$ROOT" commit -m "$msg"
+}
+
+cmd_pr() {
+    draft=""
+    [ "${1:-}" = "--draft" ] && draft="--draft"
+    branch=$(current_branch)
+    [ "$branch" != "$(default_branch)" ] || die "refusing to open a PR from the default branch"
+    cmd_check
+    say "pushing $branch"
+    git -C "$ROOT" push --quiet -u origin "$branch"
+    say "opening pull request"
+    # --fill takes the body from commits; the template is applied by GitHub when empty.
+    url=$(cd "$ROOT" && gh pr create --fill $draft)
+    say "$url"
+}
+
+cmd_sync() {
+    base=$(default_branch)
+    say "rebasing $(current_branch) onto origin/$base"
+    git -C "$ROOT" fetch --quiet origin
+    git -C "$ROOT" rebase "origin/$base"
+}
+
+cmd_done() {
+    branch=$(current_branch)
+    base=$(default_branch)
+    [ "$branch" != "$base" ] || die "already on $base; run 'done' from a feature worktree"
+    state=$(cd "$ROOT" && gh pr view "$branch" --json state --jq .state 2>/dev/null) ||
+        die "no pull request found for $branch"
+    [ "$state" = "MERGED" ] || die "pull request for $branch is $state, not MERGED"
+    path=$(git -C "$ROOT" rev-parse --show-toplevel)
+    [ "$path" != "$PRIMARY" ] || die "$branch is checked out in the primary checkout; switch it to $base first"
+
+    say "removing worktree $path"
+    git -C "$PRIMARY" worktree remove "$path"
+    say "deleting local branch $branch"
+    git -C "$PRIMARY" branch -D "$branch"
+    git -C "$PRIMARY" worktree prune
+    git -C "$PRIMARY" fetch --quiet --prune origin
+    say "updating $base"
+    git -C "$PRIMARY" merge --quiet --ff-only "origin/$base"
+    say "done: cd $PRIMARY"
+}
+
+cmd_list() {
+    git -C "$PRIMARY" worktree list --porcelain | awk '/^worktree /{p=$2} /^branch /{sub("refs/heads/","",$2); print p"\t"$2}' |
+        while IFS="$(printf '\t')" read -r path branch; do
+            state=$(cd "$PRIMARY" && gh pr view "$branch" --json state,url --jq '.state+" "+.url' 2>/dev/null || echo "no PR")
+            printf '%-40s %-50s %s\n' "$branch" "$path" "$state"
+        done
+}
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: scripts/agent <command>
+  doctor              verify tools, auth, hooks, and a clean tree
+  start <type>/<slug> create a branch and worktree from the default branch
+  check               run scripts/task check
+  commit <message>    commit with a validated Conventional Commit message
+  pr [--draft]        check, push, and open a pull request
+  sync                rebase onto the default branch
+  done                after merge: remove worktree and branch
+  list                worktrees, branches, and PR state
+USAGE
+    exit 2
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+case "$cmd" in
+    doctor | start | check | commit | pr | sync | done | list) "cmd_$cmd" "$@" ;;
+    *) usage ;;
+esac
