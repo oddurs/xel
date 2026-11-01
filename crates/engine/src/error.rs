@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use crate::schema::{ColumnId, TableId};
+use crate::rows::RowId;
+use crate::schema::{ColumnId, ColumnType, TableId};
 
 /// Everything the engine can fail with. Callers match on the variant; the message is
 /// for people.
@@ -44,6 +45,16 @@ pub enum Error {
     LastColumn(ColumnId),
     #[error("column {0:?} is not a select column")]
     NotASelectColumn(ColumnId),
+    #[error("row {0:?} does not exist")]
+    NoSuchRow(RowId),
+    #[error("column {column:?} holds {expected} values, not {found}")]
+    TypeMismatch {
+        column: String,
+        expected: ColumnType,
+        found: &'static str,
+    },
+    #[error("{value:?} is not one of the options in column {column:?}")]
+    NotAnOption { column: String, value: String },
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }

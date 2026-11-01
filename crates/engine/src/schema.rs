@@ -36,9 +36,13 @@ CREATE TABLE xel_select_options (
 /// The longest table or column name accepted, in characters.
 const MAX_NAME: usize = 255;
 
-/// Names SQLite gives the implicit row id. A user column with one of them would hide
-/// the row id, and SQLite refuses to rename or drop it later.
-const ROWID_ALIASES: [&str; 3] = ["rowid", "oid", "_rowid_"];
+/// The row identity column every user table starts with. An explicit INTEGER PRIMARY
+/// KEY keeps row ids stable: SQLite's VACUUM may renumber an implicit rowid.
+pub(crate) const ROW_ID: &str = "_id";
+
+/// Column names users cannot take: xel's row id, and the names SQLite gives the
+/// implicit row id, which SQLite refuses to rename or drop later.
+const RESERVED_COLUMNS: [&str; 4] = [ROW_ID, "rowid", "oid", "_rowid_"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TableId(pub(crate) i64);
@@ -152,8 +156,9 @@ impl Workbook {
         ensure_table_name_free(&tx, name)?;
         let defs: Vec<String> = columns.iter().map(|(c, ty)| ty.sql(&quote(c))).collect();
         tx.execute_batch(&format!(
-            "CREATE TABLE {} ({}) STRICT;",
+            "CREATE TABLE {} ({} INTEGER PRIMARY KEY, {}) STRICT;",
             quote(name),
+            quote(ROW_ID),
             defs.join(", ")
         ))?;
         tx.execute(
@@ -389,13 +394,13 @@ fn check_name(name: &str) -> Result<()> {
 
 fn check_column_name(name: &str) -> Result<()> {
     check_name(name)?;
-    if ROWID_ALIASES
+    if RESERVED_COLUMNS
         .iter()
-        .any(|alias| alias.eq_ignore_ascii_case(name))
+        .any(|r| r.eq_ignore_ascii_case(name))
     {
         return Err(Error::InvalidName {
             name: name.into(),
-            reason: "rowid, oid, and _rowid_ are reserved by SQLite".into(),
+            reason: "_id, rowid, oid, and _rowid_ are reserved".into(),
         });
     }
     Ok(())
@@ -493,7 +498,7 @@ mod tests {
     fn sql_columns(path: &std::path::Path, table: &str) -> Vec<(String, String)> {
         let raw = Connection::open(path).unwrap();
         let mut stmt = raw
-            .prepare("SELECT name, type FROM pragma_table_info(?1)")
+            .prepare("SELECT name, type FROM pragma_table_info(?1) WHERE name <> '_id'")
             .unwrap();
         stmt.query_map([table], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
@@ -543,6 +548,36 @@ mod tests {
     }
 
     #[test]
+    fn every_table_has_a_stable_integer_row_id() {
+        let dir = TempDir::new();
+        let (mut book, path) = book(&dir);
+        book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        book.close().unwrap();
+        let raw = Connection::open(&path).unwrap();
+        let pk: (String, String, i64) = raw
+            .query_row(
+                "SELECT name, type, pk FROM pragma_table_info('T') WHERE pk = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pk, ("_id".into(), "INTEGER".into(), 1));
+        // VACUUM renumbers implicit rowids but never an INTEGER PRIMARY KEY.
+        raw.execute_batch(
+            "INSERT INTO T (a) VALUES ('x'), ('y'), ('z'); DELETE FROM T WHERE a = 'x'; VACUUM;",
+        )
+        .unwrap();
+        let ids: Vec<i64> = raw
+            .prepare("SELECT _id FROM T ORDER BY _id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, [2, 3]);
+    }
+
+    #[test]
     fn storage_of_each_type_is_what_plain_sqlite_sees() {
         let dir = TempDir::new();
         let (mut book, path) = book(&dir);
@@ -557,7 +592,7 @@ mod tests {
         .unwrap();
         book.close().unwrap();
         let raw = Connection::open(&path).unwrap();
-        raw.execute("INSERT INTO T VALUES (1.5, 1, '2024-02-29')", [])
+        raw.execute("INSERT INTO T (n, c, d) VALUES (1.5, 1, '2024-02-29')", [])
             .unwrap();
         let row: (String, String, String) = raw
             .query_row("SELECT typeof(n), typeof(c), typeof(d) FROM T", [], |r| {
@@ -584,7 +619,7 @@ mod tests {
             .create_table("Old", &[("a", ColumnType::Number)])
             .unwrap();
         book.conn
-            .execute("INSERT INTO \"Old\" VALUES (42)", [])
+            .execute("INSERT INTO \"Old\" (a) VALUES (42)", [])
             .unwrap();
         let col = book.tables().unwrap()[0].columns[0].id;
 
@@ -625,8 +660,11 @@ mod tests {
             raw.execute("INSERT INTO T (Deadline) VALUES ('soon')", [])
                 .is_err()
         );
-        raw.execute("INSERT INTO T VALUES (1, '2026-01-31')", [])
-            .unwrap();
+        raw.execute(
+            "INSERT INTO T (Finished, Deadline) VALUES (1, '2026-01-31')",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -709,7 +747,7 @@ mod tests {
     fn rowid_aliases_are_not_column_names() {
         let dir = TempDir::new();
         let (mut book, _) = book(&dir);
-        for alias in ["rowid", "ROWID", "oid", "_rowid_"] {
+        for alias in ["_id", "rowid", "ROWID", "oid", "_rowid_"] {
             assert!(
                 matches!(
                     book.create_table("T", &[(alias, ColumnType::Text)]),
