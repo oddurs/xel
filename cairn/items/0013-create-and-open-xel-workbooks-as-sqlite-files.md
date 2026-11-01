@@ -35,3 +35,7 @@ Evidence: sqlite3 on a created file lists xel_meta with format_version=1 and cre
 ## Result
 
 Workbook::create/open in crates/engine/src/workbook.rs; FORMAT_VERSION=1 in xel_meta; application_id XEL1; typed Error enum in error.rs.
+
+## 2026-11-01
+
+Review (code-review high + independent reviewer, two rounds) found and this PR fixes: relative file: URIs reaching another database (bundled SQLite always parses URIs; paths are now made absolute), check-then-create race (create_new), half-made files after failed create, refused newer files written by WAL checkpoint (checks run on a read-only connection), hot-journal crash recovery broken by that read-only check (falls back to the writer), read-only files opening silently, permission and missing-file errors reported as NotAWorkbook, workbook detection by error text (now application_id). Each has a test; the crash test was confirmed to fail with the fallback disabled.
