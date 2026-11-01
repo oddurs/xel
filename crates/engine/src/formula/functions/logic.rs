@@ -4,8 +4,19 @@ use std::cmp::Ordering;
 
 use super::{each_value, result, truth, value};
 use crate::formula::ast::ErrorKind;
-use crate::formula::eval::{Arg, Args, as_range, broadcast};
+use crate::formula::eval::{Arg, Args, Range, as_range, broadcast};
 use crate::formula::value::{Value, compare};
+
+/// A branch or fallback as a range for broadcasting. An empty range stands for a blank:
+/// it must not shrink the result, which follows the test or value being checked.
+fn secondary(arg: Arg<'_>) -> Range<'_> {
+    let r = as_range(arg);
+    if r.values().is_empty() {
+        Range::single(Value::Empty)
+    } else {
+        r
+    }
+}
 
 /// `IF(test, [if_true], [if_false])`. Only the branch taken is evaluated, and it passes
 /// through as written, so a reference or array stays one. A test that is a range picks
@@ -24,7 +35,7 @@ pub(super) fn if_<'a>(args: &Args<'a>) -> Arg<'a> {
     };
     match args.arg(0) {
         Arg::Range(test) => {
-            let ranges = [test, as_range(branch(1)), as_range(branch(2))];
+            let ranges = [test, secondary(branch(1)), secondary(branch(2))];
             Arg::Range(broadcast(&ranges, |v| match truth(&v[0]) {
                 Ok(true) => v[1].clone(),
                 Ok(false) => v[2].clone(),
@@ -66,7 +77,7 @@ fn replace_errors<'a>(args: &Args<'a>, catches: fn(ErrorKind) -> bool) -> Arg<'a
     };
     match args.arg(0) {
         Arg::Range(r) => {
-            let ranges = [r, as_range(fallback())];
+            let ranges = [r, secondary(fallback())];
             Arg::Range(broadcast(&ranges, |v| match &v[0] {
                 Value::Error(e) if catches(*e) => v[1].clone(),
                 other => other.clone(),
@@ -174,6 +185,7 @@ mod tests {
             ("=IF(\"true\",1,2)", n(1.0)),
             ("=IF(\"x\",1,2)", err(E::Value)),
             ("=IF(FALSE,1)", b(false)),
+            ("=IF(TRUE)", err(E::Value)),
             ("=IF(TRUE,,1)", n(0.0)),
             ("=IF(FALSE,1,)", n(0.0)),
             ("=IF(NA(),1,2)", err(E::NA)),
@@ -214,8 +226,11 @@ mod tests {
             ("=IFERROR(1/0,)", n(0.0)),
             ("=IFNA(NA(),1)", n(1.0)),
             ("=IFNA(1/0,1)", err(E::Div0)),
+            ("=IFNA(,1)", n(0.0)),
             ("=SUM(IFERROR([Errs],0))", n(4.0)),
             ("=SUM(IFERROR([Nums]/[Zero],0))", n(1.0)),
+            ("=SUM(IFERROR([Nums],[Empty]))", n(10.0)),
+            ("=SUM(IF([Nums]>2,[Nums],[Empty]))", n(7.0)),
         ]);
     }
 
@@ -235,6 +250,8 @@ mod tests {
             ("=XOR(TRUE,TRUE)", b(false)),
             ("=NOT(0)", b(true)),
             ("=NOT(\"x\")", err(E::Value)),
+            ("=NOT()", err(E::Value)),
+            ("=NOT(NA())", err(E::NA)),
         ]);
     }
 }

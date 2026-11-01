@@ -99,7 +99,7 @@ pub(crate) static FUNCTIONS: &[Function] = &[
     ),
     func!(
         "IF",
-        1,
+        2,
         Some(3),
         "IF(logical_test, [value_if_true], [value_if_false])",
         "Returns one value if a condition is TRUE and another if it is FALSE.",

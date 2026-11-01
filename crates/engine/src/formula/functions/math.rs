@@ -261,6 +261,16 @@ mod tests {
             ("=SQRT(-1)", err(E::Num)),
             ("=POWER(2,10)", n(1024.0)),
             ("=POWER(0,0)", err(E::Num)),
+            // Empty and error arguments.
+            ("=ABS()", err(E::Value)),
+            ("=ABS(\"x\")", err(E::Value)),
+            ("=ABS(NA())", err(E::NA)),
+            ("=INT(\"\")", err(E::Value)),
+            ("=INT(1/0)", err(E::Div0)),
+            ("=MOD(,1)", n(0.0)),
+            ("=MOD(1,)", err(E::Div0)),
+            ("=SQRT(,)", err(E::Value)),
+            ("=POWER(,2)", n(0.0)),
         ]);
     }
 }

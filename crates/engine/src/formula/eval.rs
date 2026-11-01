@@ -62,7 +62,7 @@ impl<'a> Range<'a> {
         }
     }
 
-    fn single(value: Value) -> Self {
+    pub(crate) fn single(value: Value) -> Self {
         Self {
             rows: 1,
             cols: 1,
@@ -195,7 +195,7 @@ pub fn evaluate(expr: &Expr, ctx: &dyn Context) -> Value {
 
 /// One value from an argument. A 1×1 range is its value; a larger one where one value
 /// is wanted is `#VALUE!` (Excel would spill or intersect; neither applies to a table cell).
-pub(crate) fn scalar(arg: Arg<'_>) -> Value {
+fn scalar(arg: Arg<'_>) -> Value {
     match arg {
         Arg::Value(v) | Arg::Ref(v) => v,
         Arg::Range(r) if r.rows == 1 && r.cols == 1 => r.values[0].clone(),

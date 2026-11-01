@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 
 use super::result;
 use crate::formula::ast::ErrorKind;
-use crate::formula::eval::{Arg, Args, Range};
+use crate::formula::eval::{Arg, Args, Range, as_range};
 use crate::formula::value::{Value, compare, number_from_text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,14 +20,39 @@ enum Op {
     Ge,
 }
 
+impl Op {
+    fn holds(self, o: Ordering) -> bool {
+        match self {
+            Self::Eq => o == Ordering::Equal,
+            Self::Ne => o != Ordering::Equal,
+            Self::Lt => o == Ordering::Less,
+            Self::Le => o != Ordering::Greater,
+            Self::Gt => o == Ordering::Greater,
+            Self::Ge => o != Ordering::Less,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tok {
+    Any,
+    One,
+    Char(char),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Target {
     Number(f64),
     Bool(bool),
-    /// Lower-cased text, possibly with wildcards.
-    Text(String),
-    /// `""`, `"="`: blank cells. With `<>`: anything not blank.
-    Blank,
+    /// The text as written (for ordering) and its lower-cased wildcard pattern.
+    Text {
+        text: String,
+        pattern: Vec<Tok>,
+    },
+    /// `""` matches empty cells and empty text.
+    BlankOrEmptyText,
+    /// `"="` matches only truly empty cells; `"<>"` matches anything else, including "".
+    Empty,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,26 +63,14 @@ struct Criterion {
 
 impl Criterion {
     fn parse(v: &Value) -> Result<Self, ErrorKind> {
+        let eq = |target| Ok(Self { op: Op::Eq, target });
         let text = match v {
-            Value::Number(n) | Value::Date(n) => {
-                return Ok(Self {
-                    op: Op::Eq,
-                    target: Target::Number(*n),
-                });
-            }
-            Value::Bool(b) => {
-                return Ok(Self {
-                    op: Op::Eq,
-                    target: Target::Bool(*b),
-                });
-            }
-            Value::Empty => {
-                return Ok(Self {
-                    op: Op::Eq,
-                    target: Target::Blank,
-                });
-            }
+            Value::Number(n) | Value::Date(n) => return eq(Target::Number(*n)),
+            Value::Bool(b) => return eq(Target::Bool(*b)),
+            // Excel's documentation: an empty criteria cell is treated as 0.
+            Value::Empty => return eq(Target::Number(0.0)),
             Value::Error(e) => return Err(*e),
+            Value::Text(s) if s.is_empty() => return eq(Target::BlankOrEmptyText),
             Value::Text(s) => s.as_str(),
         };
         let ops = [
@@ -73,7 +86,7 @@ impl Criterion {
             .find_map(|(prefix, op)| text.strip_prefix(prefix).map(|rest| (*op, rest)))
             .unwrap_or((Op::Eq, text));
         let target = if rest.is_empty() {
-            Target::Blank
+            Target::Empty
         } else if let Some(n) = number_from_text(rest) {
             Target::Number(n)
         } else if rest.eq_ignore_ascii_case("TRUE") {
@@ -81,63 +94,52 @@ impl Criterion {
         } else if rest.eq_ignore_ascii_case("FALSE") {
             Target::Bool(false)
         } else {
-            Target::Text(rest.to_lowercase())
+            Target::Text {
+                text: rest.into(),
+                pattern: tokens(&rest.to_lowercase()),
+            }
         };
         Ok(Self { op, target })
     }
 
     fn matches(&self, cell: &Value) -> bool {
-        let blank = matches!(cell, Value::Empty) || matches!(cell, Value::Text(s) if s.is_empty());
-        let ord = |o: Ordering| match self.op {
-            Op::Eq => o == Ordering::Equal,
-            Op::Ne => o != Ordering::Equal,
-            Op::Lt => o == Ordering::Less,
-            Op::Le => o != Ordering::Greater,
-            Op::Gt => o == Ordering::Greater,
-            Op::Ge => o != Ordering::Less,
-        };
+        let empty = matches!(cell, Value::Empty);
         match &self.target {
-            Target::Blank => match self.op {
-                Op::Ne => !blank,
-                _ => blank,
-            },
+            Target::BlankOrEmptyText => empty || matches!(cell, Value::Text(s) if s.is_empty()),
+            Target::Empty => (self.op == Op::Ne) != empty,
             Target::Number(n) => {
-                // Numbers, and text that reads as a number, compare numerically; for
-                // anything else only "not equal" holds.
                 let cell_number = match cell {
                     Value::Number(x) | Value::Date(x) => Some(*x),
-                    Value::Text(s) => number_from_text(s),
+                    // Text that reads as a number matches an equality, not an inequality.
+                    Value::Text(s) if self.op == Op::Eq => number_from_text(s),
                     _ => None,
                 };
                 match cell_number {
-                    Some(x) => compare(&Value::Number(x), &Value::Number(*n)).is_ok_and(ord),
+                    Some(x) => compare(&Value::Number(x), &Value::Number(*n))
+                        .is_ok_and(|o| self.op.holds(o)),
                     None => self.op == Op::Ne,
                 }
             }
             Target::Bool(b) => match cell {
-                Value::Bool(x) => ord(x.cmp(b)),
+                Value::Bool(x) => self.op.holds(x.cmp(b)),
                 _ => self.op == Op::Ne,
             },
-            Target::Text(pattern) => match cell {
-                Value::Text(s) => match self.op {
-                    Op::Eq => wildcard(pattern, &s.to_lowercase()),
-                    Op::Ne => !wildcard(pattern, &s.to_lowercase()),
-                    _ => ord(s.to_lowercase().as_str().cmp(pattern.as_str())),
-                },
-                _ => self.op == Op::Ne,
+            Target::Text { text, pattern } => match (cell, self.op) {
+                (Value::Text(s), Op::Eq) => wildcard(pattern, &s.to_lowercase()),
+                (Value::Text(s), Op::Ne) => !wildcard(pattern, &s.to_lowercase()),
+                // Ordering text compares as the < and > operators do.
+                (Value::Text(s), op) => {
+                    compare(&Value::Text(s.clone()), &Value::Text(text.clone()))
+                        .is_ok_and(|o| op.holds(o))
+                }
+                (_, op) => op == Op::Ne,
             },
         }
     }
 }
 
-/// Excel's wildcard match: `*` any run, `?` one character, `~` makes the next literal.
-fn wildcard(pattern: &str, text: &str) -> bool {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Tok {
-        Any,
-        One,
-        Char(char),
-    }
+/// A wildcard pattern: `*` any run, `?` one character, `~` makes the next literal.
+fn tokens(pattern: &str) -> Vec<Tok> {
     let mut toks = Vec::new();
     let mut chars = pattern.chars();
     while let Some(c) = chars.next() {
@@ -148,8 +150,12 @@ fn wildcard(pattern: &str, text: &str) -> bool {
             c => Tok::Char(c),
         });
     }
+    toks
+}
+
+/// Matches `text` against a tokenized pattern, backtracking to the last `*`.
+fn wildcard(toks: &[Tok], text: &str) -> bool {
     let text: Vec<char> = text.chars().collect();
-    // Iterative matching with backtracking to the last `*`, linear in practice.
     let (mut t, mut p) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while t < text.len() {
@@ -182,22 +188,21 @@ fn wildcard(pattern: &str, text: &str) -> bool {
 /// The cells a criterion is tested against. Excel only accepts a reference here.
 fn cells(arg: Arg<'_>) -> Result<Range<'_>, ErrorKind> {
     match arg {
-        Arg::Range(r) => Ok(r),
-        Arg::Ref(v) => Ok(Range::new(1, 1, vec![v].into()).expect("one value, 1×1")),
         Arg::Value(Value::Error(e)) => Err(e),
         Arg::Value(_) => Err(ErrorKind::Value),
+        reference => Ok(as_range(reference)),
     }
 }
 
-/// The values of `target` (or of `range` itself) at the positions where `range` matches,
-/// keeping only numbers, as SUMIF and AVERAGEIF do. Errors in matched cells propagate.
+/// The values of the sum range (or of `range` itself) where `range` matches, keeping only
+/// numbers, as SUMIF and AVERAGEIF do. Errors in matched cells propagate.
 fn matched_numbers(args: &Args<'_>) -> Result<Vec<f64>, ErrorKind> {
     let range = cells(args.arg(0))?;
     let criterion = Criterion::parse(&args.value(1))?;
-    let target = if args.len() > 2 && !args.is_missing(2) {
-        cells(args.arg(2))?
-    } else {
+    let target = if args.is_missing(2) {
         range.clone()
+    } else {
+        cells(args.arg(2))?
     };
     let mut out = Vec::new();
     for row in 0..range.rows() {
@@ -247,7 +252,7 @@ pub(super) fn countif<'a>(args: &Args<'a>) -> Arg<'a> {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::check;
-    use super::wildcard;
+    use super::{tokens, wildcard};
     use crate::formula::{ErrorKind as E, Value};
 
     fn n(x: f64) -> Value {
@@ -270,7 +275,11 @@ mod tests {
             ("", "", true),
             ("", "a", false),
         ] {
-            assert_eq!(wildcard(pattern, text), want, "{pattern} vs {text}");
+            assert_eq!(
+                wildcard(&tokens(pattern), text),
+                want,
+                "{pattern} vs {text}"
+            );
         }
     }
 
@@ -286,7 +295,11 @@ mod tests {
             ("=COUNTIF([Words],\"BANANA\")", n(1.0)),
             ("=COUNTIF([Words],\"*e*\")", n(2.0)),
             ("=COUNTIF([Words],\"\")", n(2.0)),
-            ("=COUNTIF([Words],\"<>\")", n(3.0)),
+            ("=COUNTIF([Words],\"<>\")", n(4.0)),
+            ("=COUNTIF([Words],\"=\")", n(1.0)),
+            ("=COUNTIF([Mixed],\">1\")", n(1.0)),
+            ("=COUNTIF([Zero],)", n(2.0)),
+            ("=COUNTIF([Words],\">_\")", n(3.0)),
             ("=COUNTIF([Words],\">b\")", n(2.0)),
             ("=COUNTIF([Bools],TRUE)", n(1.0)),
             ("=COUNTIF([Errs],\">0\")", n(2.0)),
