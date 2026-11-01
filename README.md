@@ -1,5 +1,6 @@
 # xel
 
+[![CI](https://github.com/oddurs/xel/actions/workflows/ci.yml/badge.svg)](https://github.com/oddurs/xel/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A local-first macOS spreadsheet where the file is a database.
