@@ -3,6 +3,7 @@
 
 mod ast;
 mod eval;
+mod functions;
 mod parser;
 mod value;
 
