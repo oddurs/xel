@@ -4,7 +4,7 @@
 
 ## v0.1 — Typed tables, saved as SQLite
 
-`··········` 0% · 0 of 37 done · due 2027-01-31
+`#·········` 3% · 1 of 37 done · due 2027-01-31
 
 A Mac user downloads xel, builds a workbook of typed tables (typed in or imported from CSV), computes with Excel-style column formulas and total rows, and saves a .xel file that `sqlite3` reads directly.
 
@@ -12,7 +12,6 @@ A Mac user downloads xel, builds a workbook of typed tables (typed in or importe
 
 - [ ] [`0007`](https://github.com/oddurs/xel/blob/main/cairn/items/0007-choose-the-rust-to-swift-bridge.md) Choose the Rust-to-Swift bridge <sup>spike · p0 · bridge</sup>
 - [ ] [`0008`](https://github.com/oddurs/xel/blob/main/cairn/items/0008-choose-how-the-grid-renders-a-million-rows.md) Choose how the grid renders a million rows <sup>spike · p0 · grid</sup>
-- [ ] [`0009`](https://github.com/oddurs/xel/blob/main/cairn/items/0009-decide-the-number-model.md) Decide the number model <sup>spike · p0 · formula</sup>
 - [ ] [`0010`](https://github.com/oddurs/xel/blob/main/cairn/items/0010-decide-where-formula-column-values-live.md) Decide where formula column values live <sup>spike · p0 · recalc</sup>
 - [ ] [`0011`](https://github.com/oddurs/xel/blob/main/cairn/items/0011-prove-nsdocument-can-own-a-sqlite-file-safely.md) Prove NSDocument can own a SQLite file safely <sup>spike · p0 · app</sup>
 - [ ] [`0013`](https://github.com/oddurs/xel/blob/main/cairn/items/0013-create-and-open-xel-workbooks-as-sqlite-files.md) Create and open .xel workbooks as SQLite files <sup>feature · p0 · format</sup>
@@ -50,6 +49,10 @@ A Mac user downloads xel, builds a workbook of typed tables (typed in or importe
 ### blocked
 
 - [ ] [`0012`](https://github.com/oddurs/xel/blob/main/cairn/items/0012-ship-a-signed-notarized-app-from-ci.md) Ship a signed, notarized .app from CI <sup>spike · p0 · infra</sup>
+
+### done
+
+- [x] [`0009`](https://github.com/oddurs/xel/blob/main/cairn/items/0009-decide-the-number-model.md) Decide the number model <sup>spike · p0 · formula</sup>
 
 ## v0.2 — Linked tables, SQL, and free cells
 
