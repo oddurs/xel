@@ -60,6 +60,18 @@ pub enum Error {
     /// Another tool changed the file in a way an undo or redo cannot reconcile.
     #[error("the workbook was changed outside xel: {0}")]
     ChangedOutside(String),
+    #[error("formula in column {column:?}: {error}")]
+    Formula {
+        column: String,
+        error: crate::formula::ParseError,
+    },
+    /// Formula columns are added with `add_formula_column`, which takes the formula.
+    #[error("column {0:?} needs a formula")]
+    NeedsFormula(String),
+    #[error("column {0:?} is computed by a formula and cannot be edited")]
+    FormulaColumn(String),
+    #[error("column {0:?} is not a formula column")]
+    NotAFormulaColumn(ColumnId),
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }

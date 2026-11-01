@@ -86,6 +86,8 @@ pub enum CellValue {
     Number(f64),
     Checkbox(bool),
     Date(Date),
+    /// A formula's error result, such as `#DIV/0!`. Only formula columns hold these.
+    Error(crate::formula::ErrorKind),
 }
 
 impl CellValue {
@@ -96,6 +98,7 @@ impl CellValue {
             Self::Number(_) => "number",
             Self::Checkbox(_) => "checkbox",
             Self::Date(_) => "date",
+            Self::Error(_) => "error",
         }
     }
 }
