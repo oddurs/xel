@@ -117,15 +117,38 @@ cmd_commit() {
 
 cmd_pr() {
     draft=""
-    [ "${1:-}" = "--draft" ] && draft="--draft"
+    body_file=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --draft) draft="--draft" ;;
+            --body-file)
+                [ $# -ge 2 ] || die "--body-file needs a path"
+                body_file=$2
+                shift
+                ;;
+            *) die "usage: scripts/agent pr [--draft] [--body-file <path>]" ;;
+        esac
+        shift
+    done
     branch=$(current_branch)
-    [ "$branch" != "$(default_branch)" ] || die "refusing to open a PR from the default branch"
+    base=$(default_branch)
+    [ "$branch" != "$base" ] || die "refusing to open a PR from the default branch"
+    git -C "$ROOT" fetch --quiet origin
+    title=$(git -C "$ROOT" log --reverse --format=%s "origin/$base..HEAD" | head -n 1)
+    [ -n "$title" ] || die "no commits ahead of origin/$base"
+    # Without a written body, start from the template so the PR still asks for the
+    # problem, the approach, and the weak spots.
+    body_file=${body_file:-$ROOT/.github/PULL_REQUEST_TEMPLATE.md}
+    [ -f "$body_file" ] || die "body file not found: $body_file"
+    if grep -Eiq '^co-authored-by:|generated (with|by) |🤖' "$body_file"; then
+        die "remove tool attribution from $body_file"
+    fi
+
     cmd_check
     say "pushing $branch"
     git -C "$ROOT" push --quiet -u origin "$branch"
-    say "opening pull request"
-    # --fill takes the body from commits; the template is applied by GitHub when empty.
-    url=$(cd "$ROOT" && gh pr create --fill $draft)
+    say "opening pull request: $title"
+    url=$(cd "$ROOT" && gh pr create --base "$base" --title "$title" --body-file "$body_file" $draft)
     say "$url"
 }
 
@@ -172,7 +195,8 @@ usage: scripts/agent <command>
   start <type>/<slug> create a branch and worktree from the default branch
   check               run scripts/task check
   commit <message>    commit with a validated Conventional Commit message
-  pr [--draft]        check, push, and open a pull request
+  pr [--draft] [--body-file <path>]
+                      check, push, and open a pull request
   sync                rebase onto the default branch
   done                after merge: remove worktree and branch
   list                worktrees, branches, and PR state
