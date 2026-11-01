@@ -3,7 +3,7 @@ id: 12
 uid: f561e48e-b481-4a45-b2d6-2fc22cf07f07
 title: Ship a signed, notarized .app from CI
 type: spike
-status: planned
+status: blocked
 milestone: v0.1
 created: 2026-11-01
 updated: 2026-11-01
@@ -27,3 +27,7 @@ Two days. Requires an Apple Developer account. Answer with the workflow steps an
 ## Answer
 
 Write the answer here before closing. A spike that closes without one was wasted.
+
+## 2026-11-01
+
+Split on 2026-11-01: the unsigned bundle moved to 0118. This item is now only Developer ID signing and notarization, blocked on an Apple Developer account and a Developer ID Application certificate; neither exists on the build machine (security find-identity shows only a development identity).
