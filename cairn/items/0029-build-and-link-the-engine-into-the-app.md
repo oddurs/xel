@@ -3,8 +3,10 @@ id: 29
 uid: fc042b06-4f2c-4b61-9ef7-3c98a6325659
 title: Build and link the engine into the app
 type: chore
-status: planned
+status: doing
 milestone: v0.1
+assignee: Oddur Sigurdsson
+claimed: 2026-11-01
 depends_on:
 - 7
 created: 2026-11-01

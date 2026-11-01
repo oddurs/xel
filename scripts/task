@@ -6,12 +6,20 @@ cd "$(dirname "$0")/.."
 
 SWIFT_SOURCES="app/Package.swift app/Sources"
 
-# Where cargo writes the engine's static library: honours CARGO_TARGET_DIR and the
-# profile (XEL_PROFILE=release for release builds; debug otherwise).
+# Cargo's target directory, honouring CARGO_TARGET_DIR.
+cargo_target_dir() {
+    cargo metadata --format-version 1 --no-deps |
+        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'
+}
+
+# The build profile: XEL_PROFILE=release for release builds, debug otherwise.
+profile() {
+    echo "${XEL_PROFILE:-debug}"
+}
+
+# Where cargo writes the host build of the engine's static library.
 engine_lib_dir() {
-    target=$(cargo metadata --format-version 1 --no-deps |
-        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
-    echo "$target/${XEL_PROFILE:-debug}"
+    echo "$(cargo_target_dir)/$(profile)"
 }
 
 # Generates the Swift bindings for the engine from the built static library. SwiftPM
@@ -68,14 +76,32 @@ run() {
             ;;
         build)
             profile_flag=""
-            if [ "${XEL_PROFILE:-debug}" = release ]; then
+            if [ "$(profile)" = release ]; then
                 profile_flag="--release"
             fi
             cargo build --workspace --locked $profile_flag
             bindings
-            XEL_ENGINE_LIB_DIR=$(engine_lib_dir) \
+            lib_dir=$(engine_lib_dir)
+            arch_flags=""
+            # XEL_UNIVERSAL=1 builds for Apple silicon and Intel and links a universal app.
+            # SwiftPM needs Xcode's build system for more than one architecture, so local
+            # builds with only the Command Line Tools stay host-only.
+            if [ "${XEL_UNIVERSAL:-0}" = 1 ]; then
+                target=$(cargo_target_dir)
+                lib_dir=$target/universal/$(profile)
+                mkdir -p "$lib_dir"
+                for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+                    cargo build -p xel-ffi --locked $profile_flag --target "$triple"
+                done
+                lipo -create \
+                    "$target/aarch64-apple-darwin/$(profile)/libxel_ffi.a" \
+                    "$target/x86_64-apple-darwin/$(profile)/libxel_ffi.a" \
+                    -output "$lib_dir/libxel_ffi.a"
+                arch_flags="--arch arm64 --arch x86_64"
+            fi
+            XEL_ENGINE_LIB_DIR=$lib_dir \
                 swift build --package-path app -Xswiftc -warnings-as-errors \
-                -c "${XEL_PROFILE:-debug}"
+                -c "$(profile)" $arch_flags
             ;;
         check)
             run fmt:check
