@@ -324,7 +324,7 @@ fn load_tables(conn: &Connection, only: Option<TableId>) -> Result<Vec<Table>> {
          LEFT JOIN xel_columns c ON c.table_id = t.id
          LEFT JOIN xel_select_options o ON o.column_id = c.id
          WHERE ?1 IS NULL OR t.id = ?1
-         ORDER BY t.position, c.position, o.position",
+         ORDER BY t.position, t.id, c.position, c.id, o.position",
     )?;
     let mut rows = stmt.query([only.map(|t| t.0)])?;
     let mut tables: Vec<Table> = Vec::new();
@@ -784,6 +784,34 @@ mod tests {
             })
             .collect();
         assert_eq!(shape, ["A: x[\"c\", \"a\", \"b\"] y[]", "B: z[]"]);
+    }
+
+    #[test]
+    fn tied_positions_do_not_split_tables_or_columns() {
+        let dir = TempDir::new();
+        let (mut book, _) = book(&dir);
+        let t = book
+            .create_table("U", &[("p", ColumnType::Select), ("q", ColumnType::Select)])
+            .unwrap();
+        book.create_table("V", &[("r", ColumnType::Text)]).unwrap();
+        let cols = book.table(t).unwrap().columns;
+        book.set_select_options(cols[0].id, &["p1", "p2"]).unwrap();
+        book.set_select_options(cols[1].id, &["q1", "q2"]).unwrap();
+        // Ties can only come from an outside edit today; the loader must still cope.
+        book.conn
+            .execute_batch(
+                "UPDATE xel_columns SET position = 0; UPDATE xel_tables SET position = 0;",
+            )
+            .unwrap();
+        let tables = book.tables().unwrap();
+        assert_eq!(tables.len(), 2);
+        let u = tables.iter().find(|t| t.name == "U").unwrap();
+        let shape: Vec<_> = u
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.options.len()))
+            .collect();
+        assert_eq!(shape, [("p", 2), ("q", 2)]);
     }
 
     #[test]
