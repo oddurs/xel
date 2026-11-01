@@ -11,7 +11,6 @@ PRIMARY=$(dirname "$(cd "$ROOT" && git rev-parse --path-format=absolute --git-co
 REPO=$(basename "$PRIMARY")
 WORKTREES=$(dirname "$PRIMARY")/.worktrees/$REPO
 BRANCH_RE='^(feat|fix|chore|docs|perf|refactor|test)/[a-z0-9][a-z0-9._-]*$'
-COMMIT_RE='^(feat|fix|chore|docs|perf|refactor|test|build|ci|style|revert)(\([a-z0-9._/-]+\))?!?: [^ ].*[^.]$'
 
 say() { printf '==> %s\n' "$*"; }
 die() {
@@ -28,6 +27,42 @@ default_branch() {
 }
 
 current_branch() { git -C "$ROOT" symbolic-ref --quiet --short HEAD || die "detached HEAD"; }
+
+# Prints OPEN, MERGED, CLOSED, or NONE when the branch has no pull request.
+pr_state() {
+    if out=$(cd "$PRIMARY" && gh pr view "$1" --json state --jq .state 2>&1); then
+        echo "$out"
+    elif printf '%s' "$out" | grep -q 'no pull requests found'; then
+        echo NONE
+    else
+        die "cannot read pull request for $1: $out"
+    fi
+}
+
+# Prints "<path> <branch>" for every worktree that has a branch checked out.
+worktrees() {
+    git -C "$PRIMARY" worktree list --porcelain |
+        awk '/^worktree /{p=$2} /^branch /{sub("refs/heads/","",$2); print p" "$2}'
+}
+
+retire() {
+    say "removing worktree $1"
+    git -C "$PRIMARY" worktree remove "$1"
+    say "deleting local branch $2"
+    git -C "$PRIMARY" branch -D "$2"
+}
+
+update_primary() {
+    base=$(default_branch)
+    git -C "$PRIMARY" worktree prune
+    git -C "$PRIMARY" fetch --quiet --prune origin
+    if [ "$(git -C "$PRIMARY" symbolic-ref --quiet --short HEAD)" = "$base" ]; then
+        say "updating $base"
+        git -C "$PRIMARY" merge --quiet --ff-only "origin/$base"
+    else
+        say "primary checkout is not on $base; leaving it alone"
+    fi
+}
 
 cmd_doctor() {
     problems=0
@@ -106,13 +141,14 @@ cmd_check() {
 
 cmd_commit() {
     [ $# -ge 1 ] || die "usage: scripts/agent commit <message>"
-    msg=$*
-    subject=$(printf '%s\n' "$msg" | head -n 1)
-    printf '%s\n' "$subject" | grep -Eq "$COMMIT_RE" ||
-        die "not a Conventional Commit subject: '$subject'"
-    [ "${#subject}" -le 72 ] || die "subject is ${#subject} characters; the limit is 72"
-    say "committing: $subject"
-    git -C "$ROOT" commit -m "$msg"
+    msg_file=$(mktemp "${TMPDIR:-/tmp}/agent-commit.XXXXXX")
+    trap 'rm -f "$msg_file"' EXIT
+    printf '%s\n' "$*" >"$msg_file"
+    # The hook is the single definition of a valid message; running it first fails
+    # fast instead of after pre-commit has linted the tree.
+    "$ROOT/.githooks/commit-msg" "$msg_file"
+    say "committing: $(head -n 1 "$msg_file")"
+    git -C "$ROOT" commit --quiet -F "$msg_file"
 }
 
 cmd_pr() {
@@ -146,7 +182,7 @@ cmd_pr() {
 
     cmd_check
     say "pushing $branch"
-    git -C "$ROOT" push --quiet -u origin "$branch"
+    git -C "$ROOT" push --quiet --force-with-lease -u origin "$branch"
     say "opening pull request: $title"
     url=$(cd "$ROOT" && gh pr create --base "$base" --title "$title" --body-file "$body_file" $draft)
     say "$url"
@@ -163,29 +199,116 @@ cmd_done() {
     branch=$(current_branch)
     base=$(default_branch)
     [ "$branch" != "$base" ] || die "already on $base; run 'done' from a feature worktree"
-    state=$(cd "$ROOT" && gh pr view "$branch" --json state --jq .state 2>/dev/null) ||
-        die "no pull request found for $branch"
+    state=$(pr_state "$branch")
     [ "$state" = "MERGED" ] || die "pull request for $branch is $state, not MERGED"
-    path=$(git -C "$ROOT" rev-parse --show-toplevel)
-    [ "$path" != "$PRIMARY" ] || die "$branch is checked out in the primary checkout; switch it to $base first"
-
-    say "removing worktree $path"
-    git -C "$PRIMARY" worktree remove "$path"
-    say "deleting local branch $branch"
-    git -C "$PRIMARY" branch -D "$branch"
-    git -C "$PRIMARY" worktree prune
-    git -C "$PRIMARY" fetch --quiet --prune origin
-    say "updating $base"
-    git -C "$PRIMARY" merge --quiet --ff-only "origin/$base"
+    [ "$ROOT" != "$PRIMARY" ] || die "$branch is checked out in the primary checkout; switch it to $base first"
+    retire "$ROOT" "$branch"
+    update_primary
     say "done: cd $PRIMARY"
 }
 
-cmd_list() {
-    git -C "$PRIMARY" worktree list --porcelain | awk '/^worktree /{p=$2} /^branch /{sub("refs/heads/","",$2); print p"\t"$2}' |
-        while IFS="$(printf '\t')" read -r path branch; do
-            state=$(cd "$PRIMARY" && gh pr view "$branch" --json state,url --jq '.state+" "+.url' 2>/dev/null || echo "no PR")
-            printf '%-40s %-50s %s\n' "$branch" "$path" "$state"
+cmd_ship() {
+    wait=1
+    body_file=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-wait) wait=0 ;;
+            --body-file)
+                [ $# -ge 2 ] || die "--body-file needs a path"
+                body_file=$2
+                shift
+                ;;
+            *) die "usage: scripts/agent ship [--body-file <path>] [--no-wait]" ;;
+        esac
+        shift
+    done
+    branch=$(current_branch)
+    [ -z "$(git -C "$ROOT" status --porcelain)" ] || die "uncommitted changes in $ROOT; commit them first"
+
+    if [ "$(pr_state "$branch")" = "OPEN" ]; then
+        cmd_check
+        say "pushing $branch"
+        git -C "$ROOT" push --quiet --force-with-lease -u origin "$branch"
+    elif [ -n "$body_file" ]; then
+        cmd_pr --body-file "$body_file"
+    else
+        cmd_pr
+    fi
+    say "enabling auto-merge (squash)"
+    (cd "$ROOT" && gh pr merge "$branch" --auto --squash)
+
+    if [ "$wait" -eq 0 ]; then
+        say "auto-merge is on; 'scripts/agent sweep' cleans up after it merges"
+        return
+    fi
+    wait_for_merge "$branch"
+    cmd_done
+}
+
+wait_for_merge() {
+    timeout=${AGENT_SHIP_TIMEOUT:-1800}
+    deadline=$(($(date +%s) + timeout))
+    say "waiting for checks and merge (timeout ${timeout}s)"
+    while :; do
+        status=$(cd "$PRIMARY" && gh pr view "$1" --json state,mergeStateStatus --jq '.state+" "+.mergeStateStatus')
+        case "$status" in
+            MERGED*)
+                say "merged"
+                return
+                ;;
+            CLOSED*) die "pull request for $1 was closed without merging" ;;
+            *" DIRTY") die "$1 conflicts with its base; run 'scripts/agent sync', resolve, then ship again" ;;
+            *" BEHIND")
+                # Branch protection requires an up-to-date branch, and auto-merge does
+                # not update it, so a moved base would otherwise stall the merge.
+                say "$1 is behind its base; rebasing on GitHub"
+                (cd "$PRIMARY" && gh pr update-branch "$1" --rebase)
+                ;;
+        esac
+        # gh pr checks exits 8 while checks are pending and 1 on failure, or when
+        # GitHub has not registered any checks yet.
+        if checks=$(cd "$PRIMARY" && gh pr checks "$1" 2>&1); then
+            :
+        else
+            rc=$?
+            if [ "$rc" -ne 8 ] && ! printf '%s' "$checks" | grep -q 'no checks reported'; then
+                printf '%s\n' "$checks" >&2
+                die "checks failed for $1; fix, commit, and ship again"
+            fi
+        fi
+        [ "$(date +%s)" -lt "$deadline" ] ||
+            die "timed out after ${timeout}s; auto-merge stays on (gh pr view $1)"
+        sleep 20
+    done
+}
+
+cmd_sweep() {
+    base=$(default_branch)
+    say "updating auto-merge pull requests that are behind $base"
+    (cd "$PRIMARY" && gh pr list --state open --json number,mergeStateStatus,autoMergeRequest \
+        --jq '.[] | select(.autoMergeRequest != null and .mergeStateStatus == "BEHIND") | .number') |
+        while read -r number; do
+            say "rebasing #$number"
+            (cd "$PRIMARY" && gh pr update-branch "$number" --rebase)
         done
+
+    say "removing worktrees whose pull requests merged"
+    worktrees | while read -r path branch; do
+        [ "$path" != "$PRIMARY" ] || continue
+        [ "$(pr_state "$branch")" = "MERGED" ] || continue
+        if [ -n "$(git -C "$path" status --porcelain)" ]; then
+            say "keeping $path: it has uncommitted changes"
+            continue
+        fi
+        retire "$path" "$branch"
+    done
+    update_primary
+}
+
+cmd_list() {
+    worktrees | while read -r path branch; do
+        printf '%-40s %-50s %s\n' "$branch" "$path" "$(pr_state "$branch")"
+    done
 }
 
 usage() {
@@ -198,7 +321,11 @@ usage: scripts/agent <command>
   pr [--draft] [--body-file <path>]
                       check, push, and open a pull request
   sync                rebase onto the default branch
+  ship [--body-file <path>] [--no-wait]
+                      pr, then auto-merge; waits, keeps the branch current,
+                      and runs done once merged
   done                after merge: remove worktree and branch
+  sweep               rebase behind auto-merge PRs; remove merged worktrees
   list                worktrees, branches, and PR state
 USAGE
     exit 2
@@ -208,6 +335,6 @@ USAGE
 cmd=$1
 shift
 case "$cmd" in
-    doctor | start | check | commit | pr | sync | done | list) "cmd_$cmd" "$@" ;;
+    doctor | start | check | commit | pr | ship | sync | done | sweep | list) "cmd_$cmd" "$@" ;;
     *) usage ;;
 esac
