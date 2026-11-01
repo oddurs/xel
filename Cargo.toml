@@ -13,3 +13,6 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+# Every fallible engine call returns the one documented `Error` enum; repeating that in
+# an `# Errors` section on each function says nothing new.
+missing_errors_doc = "allow"
