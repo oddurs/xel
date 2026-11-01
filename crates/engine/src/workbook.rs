@@ -27,6 +27,7 @@ const READ_ONLY: OpenFlags =
 pub struct Workbook {
     pub(crate) conn: Connection,
     format_version: u32,
+    pub(crate) history: crate::history::History,
 }
 
 impl Workbook {
@@ -124,8 +125,10 @@ impl Workbook {
         self.format_version
     }
 
-    /// Closes the file, reporting failures that dropping the workbook would hide.
+    /// Closes the file, reporting failures that dropping the workbook would hide. Undo
+    /// history ends here, so the data it was keeping for deleted tables and columns goes.
     pub fn close(self) -> Result<()> {
+        crate::history::purge_trash(&self.conn)?;
         self.conn.close().map_err(|(_, e)| e.into())
     }
 
@@ -138,9 +141,12 @@ impl Workbook {
         // Another reader (sqlite3, a Python script) may briefly hold the file; wait for it
         // rather than failing the user's edit.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Trash left by a session that ended without close() has no history to serve.
+        crate::history::purge_trash(&conn)?;
         Ok(Self {
             conn,
             format_version,
+            history: crate::history::History::default(),
         })
     }
 }
