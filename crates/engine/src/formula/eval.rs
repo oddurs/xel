@@ -9,7 +9,8 @@ use std::borrow::Cow;
 use super::ast::{A1, BinaryOp, ErrorKind, Expr, Reference, UnaryOp};
 use super::value::{Value, binary, unary};
 
-/// Where a formula's references are looked up.
+/// Where a formula's references are looked up. Table and column names compare without
+/// regard to ASCII case, as SQLite identifiers do.
 pub trait Context {
     /// `[@Col]` or `Table[@Col]`: this row's value of a column. `table` is `None` for the
     /// formula's own table; a context decides whether a named table is its own.
@@ -29,21 +30,28 @@ pub trait Context {
         Err(ErrorKind::Ref)
     }
 
-    /// A defined name, passed upper-cased because Excel names ignore case.
-    fn name(&self, _name: &str) -> Result<Value, ErrorKind> {
+    /// A defined name, passed upper-cased because Excel names ignore case. A name can
+    /// stand for a value, a cell, or a range, so it answers with an [`Arg`].
+    fn name(&self, _name: &str) -> Result<Arg<'_>, ErrorKind> {
         Err(ErrorKind::Name)
     }
 }
 
-/// A rectangle of values, row by row.
+/// A rectangle of values, row by row. Its length always equals rows × columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Range<'a> {
-    pub rows: usize,
-    pub cols: usize,
-    pub values: Cow<'a, [Value]>,
+    rows: usize,
+    cols: usize,
+    values: Cow<'a, [Value]>,
 }
 
 impl<'a> Range<'a> {
+    /// A range of `rows` × `cols`, or `None` if `values` is not exactly that long.
+    #[must_use]
+    pub fn new(rows: usize, cols: usize, values: Cow<'a, [Value]>) -> Option<Self> {
+        (rows.checked_mul(cols)? == values.len()).then_some(Self { rows, cols, values })
+    }
+
     /// A single column, as a structured reference produces.
     #[must_use]
     pub fn column(values: Cow<'a, [Value]>) -> Self {
@@ -54,6 +62,30 @@ impl<'a> Range<'a> {
         }
     }
 
+    fn single(value: Value) -> Self {
+        Self {
+            rows: 1,
+            cols: 1,
+            values: Cow::Owned(vec![value]),
+        }
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    #[must_use]
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Every value, row by row.
+    #[must_use]
+    pub fn values(&self) -> &[Value] {
+        &self.values
+    }
+
     /// The value at a row and column, or `None` outside the range.
     #[must_use]
     pub fn get(&self, row: usize, col: usize) -> Option<&Value> {
@@ -61,7 +93,7 @@ impl<'a> Range<'a> {
     }
 }
 
-/// A function argument as the function sees it.
+/// A function argument or result.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Arg<'a> {
     /// A value written or computed in the formula: `1`, `"a"`, `2*3`.
@@ -69,7 +101,7 @@ pub enum Arg<'a> {
     /// One cell reached through a reference: `A1`, `[@Qty]`. Excel treats these like
     /// ranges in some functions, so `COUNT(A1)` skips text that `COUNT("1")` counts.
     Ref(Value),
-    /// A range, a column, or an array computed from one (`[Qty]*2`).
+    /// A range, a column, or an array computed from one (`[Qty]*2`, `FILTER(…)`).
     Range(Range<'a>),
 }
 
@@ -131,7 +163,9 @@ pub struct Function {
     /// For autocomplete: `IF(logical_test, [value_if_true], [value_if_false])`.
     pub signature: &'static str,
     pub description: &'static str,
-    pub eval: fn(&Args<'_>) -> Value,
+    /// Returns an [`Arg`], not a [`Value`], so `IF` and `IFERROR` can pass an array or a
+    /// reference through and `FILTER`-like functions can return arrays.
+    pub eval: for<'a> fn(&Args<'a>) -> Arg<'a>,
 }
 
 /// Every built-in function, sorted by name. Function families add themselves here.
@@ -143,7 +177,7 @@ static FUNCTIONS: &[Function] = &[
         volatile: false,
         signature: "FALSE()",
         description: "Returns the logical value FALSE.",
-        eval: |_| Value::Bool(false),
+        eval: |_| Arg::Value(Value::Bool(false)),
     },
     Function {
         name: "NA",
@@ -152,7 +186,7 @@ static FUNCTIONS: &[Function] = &[
         volatile: false,
         signature: "NA()",
         description: "Returns the error value #N/A.",
-        eval: |_| Value::Error(ErrorKind::NA),
+        eval: |_| Arg::Value(Value::Error(ErrorKind::NA)),
     },
     Function {
         name: "TRUE",
@@ -161,7 +195,7 @@ static FUNCTIONS: &[Function] = &[
         volatile: false,
         signature: "TRUE()",
         description: "Returns the logical value TRUE.",
-        eval: |_| Value::Bool(true),
+        eval: |_| Arg::Value(Value::Bool(true)),
     },
 ];
 
@@ -236,13 +270,15 @@ fn eval_arg<'a>(expr: &'a Expr, ctx: &'a dyn Context) -> Arg<'a> {
 
 fn eval_leaf<'a>(expr: &'a Expr, ctx: &'a dyn Context) -> Arg<'a> {
     let reference = |r: Result<Value, ErrorKind>| Arg::Ref(r.unwrap_or_else(Value::Error));
+    let or_error =
+        |r: Result<Arg<'a>, ErrorKind>| r.unwrap_or_else(|e| Arg::Value(Value::Error(e)));
     match expr {
         Expr::Number(n) => Arg::Value(Value::number(*n)),
         Expr::Text(s) => Arg::Value(Value::Text(s.clone())),
         Expr::Bool(b) => Arg::Value(Value::Bool(*b)),
         Expr::Error(e) => Arg::Value(Value::Error(*e)),
         Expr::Missing => Arg::Value(Value::Empty),
-        Expr::Name(n) => reference(ctx.name(&n.to_uppercase())),
+        Expr::Name(n) => or_error(ctx.name(&n.to_uppercase())),
         Expr::Ref(Reference::Structured {
             table,
             column,
@@ -252,16 +288,13 @@ fn eval_leaf<'a>(expr: &'a Expr, ctx: &'a dyn Context) -> Arg<'a> {
             table,
             column,
             this_row: false,
-        }) => match ctx.column(table.as_deref(), column) {
-            Ok(values) => Arg::Range(Range::column(values)),
-            Err(e) => Arg::Value(Value::Error(e)),
-        },
+        }) => or_error(
+            ctx.column(table.as_deref(), column)
+                .map(|v| Arg::Range(Range::column(v))),
+        ),
         Expr::Ref(Reference::Cell(a)) => reference(ctx.cell(*a)),
-        Expr::Ref(Reference::Range(a, b)) => match ctx.range(*a, *b) {
-            Ok(r) => Arg::Range(r),
-            Err(e) => Arg::Value(Value::Error(e)),
-        },
-        Expr::Call { name, args } => Arg::Value(call(name, args, ctx)),
+        Expr::Ref(Reference::Range(a, b)) => or_error(ctx.range(*a, *b).map(Arg::Range)),
+        Expr::Call { name, args } => call(name, args, ctx),
         // The spine walk in eval_arg consumes these before reaching a leaf.
         Expr::Unary { .. } | Expr::Binary { .. } => eval_arg(expr, ctx),
     }
@@ -281,22 +314,19 @@ fn map(arg: Arg<'_>, f: impl Fn(&Value) -> Value) -> Arg<'_> {
 
 /// A binary operator, element by element when either side is a range. Shapes broadcast
 /// as in Excel: a single value or a single row or column stretches to fit; cells beyond
-/// a smaller range are `#N/A`.
+/// a smaller range are `#N/A`; an empty range gives an empty result.
 fn apply_binary<'a>(op: BinaryOp, a: Arg<'a>, b: Arg<'a>) -> Arg<'a> {
     let as_range = |arg: Arg<'a>| match arg {
         Arg::Range(r) => r,
-        Arg::Value(v) | Arg::Ref(v) => Range {
-            rows: 1,
-            cols: 1,
-            values: Cow::Owned(vec![v]),
-        },
+        Arg::Value(v) | Arg::Ref(v) => Range::single(v),
     };
     if !matches!(a, Arg::Range(_)) && !matches!(b, Arg::Range(_)) {
         return Arg::Value(binary(op, &scalar(a), &scalar(b)));
     }
     let (a, b) = (as_range(a), as_range(b));
-    let rows = a.rows.max(b.rows);
-    let cols = a.cols.max(b.cols);
+    let span = |x: usize, y: usize| if x == 0 || y == 0 { 0 } else { x.max(y) };
+    let rows = span(a.rows, b.rows);
+    let cols = span(a.cols, b.cols);
     let pick = |r: &Range<'_>, row: usize, col: usize| {
         let row = if r.rows == 1 { 0 } else { row };
         let col = if r.cols == 1 { 0 } else { col };
@@ -317,12 +347,12 @@ fn apply_binary<'a>(op: BinaryOp, a: Arg<'a>, b: Arg<'a>) -> Arg<'a> {
     })
 }
 
-fn call(name: &str, args: &[Expr], ctx: &dyn Context) -> Value {
+fn call<'a>(name: &str, args: &'a [Expr], ctx: &'a dyn Context) -> Arg<'a> {
     let Some(f) = function(name) else {
-        return Value::Error(ErrorKind::Name);
+        return Arg::Value(Value::Error(ErrorKind::Name));
     };
     if args.len() < f.min_args || f.max_args.is_some_and(|max| args.len() > max) {
-        return Value::Error(ErrorKind::Value);
+        return Arg::Value(Value::Error(ErrorKind::Value));
     }
     (f.eval)(&Args { exprs: args, ctx })
 }
@@ -366,9 +396,9 @@ mod tests {
                 .ok_or(ErrorKind::Ref)
         }
 
-        fn name(&self, name: &str) -> Result<Value, ErrorKind> {
+        fn name(&self, name: &str) -> Result<Arg<'_>, ErrorKind> {
             if name == "TAXRATE" {
-                Ok(Value::Number(0.25))
+                Ok(Arg::Value(Value::Number(0.25)))
             } else {
                 Err(ErrorKind::Name)
             }
@@ -448,18 +478,18 @@ mod tests {
         let Arg::Range(r) = arg else {
             panic!("a range")
         };
-        assert_eq!((r.rows, r.cols), (2, 1));
-        assert_eq!(r.values.as_ref(), [Value::Number(0.0), Value::Number(10.0)]);
+        assert_eq!((r.rows(), r.cols()), (2, 1));
+        assert_eq!(r.values(), [Value::Number(0.0), Value::Number(10.0)]);
         let short = Range::column(Cow::Owned(vec![Value::Number(1.0)]));
-        let long = Range {
-            rows: 1,
-            cols: 3,
-            values: Cow::Owned(vec![Value::Number(1.0); 3]),
-        };
+        let long = Range::new(1, 3, Cow::Owned(vec![Value::Number(1.0); 3])).unwrap();
         let Arg::Range(r) = apply_binary(BinaryOp::Add, Arg::Range(short), Arg::Range(long)) else {
             panic!("a range")
         };
-        assert_eq!((r.rows, r.cols), (1, 3), "a single cell stretches to fit");
+        assert_eq!(
+            (r.rows(), r.cols()),
+            (1, 3),
+            "a single cell stretches to fit"
+        );
         let two_rows = Range::column(Cow::Owned(vec![Value::Number(1.0); 2]));
         let three_rows = Range::column(Cow::Owned(vec![Value::Number(1.0); 3]));
         let Arg::Range(r) =
@@ -489,13 +519,7 @@ mod tests {
         assert_eq!(args.arg(0), Arg::Ref(Value::Number(2.0)));
         assert_eq!(args.arg(1), Arg::Value(Value::Number(2.0)));
         assert!(
-            matches!(
-                args.arg(2),
-                Arg::Range(Range {
-                    values: Cow::Borrowed(_),
-                    ..
-                })
-            ),
+            matches!(args.arg(2), Arg::Range(r) if matches!(r.values, Cow::Borrowed(_))),
             "columns are borrowed"
         );
     }
