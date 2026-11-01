@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, edited]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -24,10 +25,30 @@ jobs:
       - run: swift --version
       - run: scripts/task check
 
-  required:
-    if: always()
-    needs: [check]
+  pr-title:
+    # The squash merge uses the PR title as the commit subject on main.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - name: All jobs passed
-        run: test "${{ needs.check.result }}" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$TITLE" > "$RUNNER_TEMP/title"
+          .githooks/commit-msg "$RUNNER_TEMP/title"
+
+  required:
+    if: always()
+    needs: [check, pr-title]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All jobs passed or were skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) echo "a required job ended in: $result"; exit 1 ;;
+            esac
+          done
