@@ -10,9 +10,15 @@ A local-first macOS spreadsheet where the file is a database. Rust engine in
   with another task or agent.
 - Start work: `scripts/agent start <type>/<slug>`, then `cd` to the printed path.
   `type` is one of `feat fix chore docs perf refactor test`.
-- Commit: `scripts/agent commit "<message>"`. Open the PR:
-  `scripts/agent pr --body-file <path>`, with the body written from the template.
-  After merge: `scripts/agent done`. Run `scripts/agent doctor` when something is off.
+- Commit: `scripts/agent commit "<message>"`.
+- Finish: `scripts/agent ship --body-file <path>`, with the body written from the PR
+  template. It opens the PR, enables auto-merge, keeps the branch current, waits for
+  CI, and removes the worktree after the merge. If it stops, fix what it reports and
+  run `ship` again.
+- Use `scripts/agent pr --body-file <path>` instead when the change needs a human
+  decision before merging (design, scope, anything irreversible), and say so in the PR.
+- `scripts/agent sweep` cleans up merged worktrees and updates stalled auto-merge PRs.
+  Run `scripts/agent doctor` when something is off.
 - Use `scripts/agent sync` to rebase onto `main`; do not merge `main` into a branch.
 
 ## Checks

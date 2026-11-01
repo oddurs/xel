@@ -19,9 +19,18 @@ GitHub; the `pre-push` hook enforces it locally.
 2. Work in that worktree. Never share a checkout between two tasks or two agents.
 3. Commit with `scripts/agent commit "<message>"`.
 4. `scripts/agent sync` rebases onto `main` when it moves.
-5. `scripts/agent pr --body-file <path>` runs the full check, pushes, and opens the
-   pull request. Without `--body-file` the body is the empty template; fill it in.
-6. After the squash merge, `scripts/agent done` removes the worktree and branch.
+5. `scripts/agent ship --body-file <path>` runs the full check, pushes, opens the
+   pull request, and turns on auto-merge. It then waits: it rebases the branch on
+   GitHub when `main` moves, stops on a failed check or a conflict, and after the
+   squash merge removes the worktree and branch. `--no-wait` returns once auto-merge
+   is on. Without `--body-file` the body is the empty template; fill it in.
+6. For a change that needs review before merging, use `scripts/agent pr` instead and
+   run `scripts/agent done` after it merges.
+7. `scripts/agent sweep` rebases auto-merge pull requests that fell behind `main` and
+   removes worktrees whose pull requests have merged.
+
+Dependabot minor and patch updates merge on their own once CI passes. Major updates
+wait for review.
 
 ## Commits
 

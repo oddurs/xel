@@ -48,8 +48,7 @@ Work happens on a branch in its own worktree and lands through a pull request:
 scripts/agent doctor                  # verify tools, auth, and hooks
 scripts/agent start feat/my-change    # new branch + worktree; prints the path
 scripts/agent commit "feat: ..."      # Conventional Commit, validated
-scripts/agent pr                      # check, push, open the pull request
-scripts/agent done                    # after merge: remove worktree and branch
+scripts/agent ship                    # check, open the PR, auto-merge, clean up
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
