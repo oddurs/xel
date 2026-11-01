@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # Not `edited`: a description edit would start a run that cancels the one testing the
+  # code, and the cancelled run's `required` job reports a failure. Titles are checked on
+  # every push; scripts/agent sets them from a checked commit subject.
   pull_request:
-    types: [opened, synchronize, reopened, edited]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
