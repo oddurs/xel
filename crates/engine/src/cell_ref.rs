@@ -33,18 +33,15 @@ impl fmt::Display for ParseCellRefError {
 
 impl std::error::Error for ParseCellRefError {}
 
-impl FromStr for CellRef {
-    type Err = ParseCellRefError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let split = s
-            .find(|c: char| c.is_ascii_digit())
-            .ok_or(ParseCellRefError::Malformed)?;
-        let (letters, digits) = s.split_at(split);
+impl CellRef {
+    /// Builds a cell from its column letters and row digits, as split by a caller that
+    /// has already scanned them. Leading zeros in the row are accepted, as Excel accepts
+    /// `A01` when typed.
+    pub(crate) fn from_parts(letters: &str, digits: &str) -> Result<Self, ParseCellRefError> {
         if letters.is_empty()
+            || digits.is_empty()
             || !letters.bytes().all(|b| b.is_ascii_alphabetic())
             || !digits.bytes().all(|b| b.is_ascii_digit())
-            || digits.starts_with('0')
         {
             return Err(ParseCellRefError::Malformed);
         }
@@ -60,13 +57,30 @@ impl FromStr for CellRef {
                 .ok_or(ParseCellRefError::OutOfRange)?;
         }
         let row: u32 = digits.parse().map_err(|_| ParseCellRefError::OutOfRange)?;
-        if row > MAX_ROW {
-            return Err(ParseCellRefError::OutOfRange);
+        match row {
+            0 => Err(ParseCellRefError::Malformed),
+            r if r > MAX_ROW => Err(ParseCellRefError::OutOfRange),
+            r => Ok(Self {
+                row: r - 1,
+                col: col - 1,
+            }),
         }
-        Ok(Self {
-            row: row - 1,
-            col: col - 1,
-        })
+    }
+}
+
+impl FromStr for CellRef {
+    type Err = ParseCellRefError;
+
+    /// Parses the canonical form only: no `$`, no leading zeros.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let split = s
+            .find(|c: char| c.is_ascii_digit())
+            .ok_or(ParseCellRefError::Malformed)?;
+        let (letters, digits) = s.split_at(split);
+        if digits.starts_with('0') {
+            return Err(ParseCellRefError::Malformed);
+        }
+        Self::from_parts(letters, digits)
     }
 }
 

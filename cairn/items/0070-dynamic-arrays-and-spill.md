@@ -7,6 +7,7 @@ status: backlog
 milestone: v0.3
 depends_on:
 - 49
+- 120
 created: 2026-11-01
 updated: 2026-11-01
 priority: p0

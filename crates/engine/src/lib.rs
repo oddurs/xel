@@ -1,11 +1,12 @@
 //! The xel engine: storage, formulas, and recalculation for xel workbooks.
 
-// Every fallible call in this crate returns the one documented `Error` enum; an
+// Fallible calls return one documented error type per module (`Error`, `ParseError`); an
 // `# Errors` section on each function would repeat it.
 #![allow(clippy::missing_errors_doc)]
 
 mod cell_ref;
 mod error;
+pub mod formula;
 #[cfg(test)]
 mod test_support;
 mod workbook;
