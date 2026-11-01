@@ -62,9 +62,11 @@ impl Workbook {
             .conn
             .prepare_cached(&sql)
             .map_err(|e| out_of_sync(&t, e))?;
-        let mut rows = stmt.query([clamp(limit), clamp(offset)])?;
+        let mut rows = stmt
+            .query([clamp(limit), clamp(offset)])
+            .map_err(|e| out_of_sync(&t, e))?;
         let mut out = Vec::new();
-        while let Some(r) = rows.next()? {
+        while let Some(r) = rows.next().map_err(|e| out_of_sync(&t, e))? {
             let cells = t
                 .columns
                 .iter()
@@ -148,7 +150,11 @@ impl Workbook {
                 quote(ROW_ID)
             );
             let mut stmt = tx.prepare_cached(&sql).map_err(|e| out_of_sync(&t, e))?;
-            if stmt.execute(rusqlite::params![value, id])? == 0 {
+            if stmt
+                .execute(rusqlite::params![value, id])
+                .map_err(|e| out_of_sync(&t, e))?
+                == 0
+            {
                 return Err(Error::NoSuchRow(RowId { table, id }));
             }
         }
@@ -169,7 +175,9 @@ impl Workbook {
             );
             let mut stmt = tx.prepare(&sql).map_err(|e| out_of_sync(&t, e))?;
             for row in unique {
-                if row.table != table || stmt.execute([row.id])? == 0 {
+                if row.table != table
+                    || stmt.execute([row.id]).map_err(|e| out_of_sync(&t, e))? == 0
+                {
                     return Err(Error::NoSuchRow(row));
                 }
             }
@@ -573,6 +581,27 @@ mod tests {
         );
         assert!(matches!(
             f.book.insert_row(f.table, &[(f.cols[4], text("Open"))]),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn outside_changes_after_statements_are_cached_are_still_corrupt() {
+        let mut f = fixture();
+        let row = f.book.insert_row(f.table, &[]).unwrap();
+        // Warm the statement caches.
+        f.book.rows(f.table, 0, 10).unwrap();
+        f.book.set_cell(f.cols[0], row, &text("x")).unwrap();
+        Connection::open(&f.path)
+            .unwrap()
+            .execute_batch("ALTER TABLE T RENAME COLUMN Name TO Other")
+            .unwrap();
+        assert!(matches!(
+            f.book.rows(f.table, 0, 10),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            f.book.set_cell(f.cols[0], row, &text("y")),
             Err(Error::Corrupt(_))
         ));
     }
