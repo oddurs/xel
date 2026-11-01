@@ -28,7 +28,7 @@ Evaluate operators and structured references against a row context (`[@Col]` is 
 ## Acceptance criteria
 
 - [x] `=[@Qty]*[@Price]` evaluates per row, covered by a test
-- [x] A reference to a missing column yields #REF! and the cell shows it
+- [ ] A reference to a missing column yields #REF! and the cell shows it
 - [x] Evaluation of 100,000 simple row formulas takes under 50 ms in a benchmark
 
 ## 2026-11-01
@@ -38,3 +38,7 @@ Benchmark (release, M4 Pro): 100,000 evaluations of =[@Qty]*[@Price]+1 in 8.9 ms
 ## Result
 
 crates/engine/src/formula/eval.rs: evaluate(expr, &dyn Context) -> Value; Context trait (this_row, column, cell, range, name); lazy Args (len, is_missing, value, arg) and Arg {Value, Range}; Function registry (name, min/max args, volatile, signature, description, eval) sorted for binary search via function(name) and functions(); unknown function #NAME?, wrong arity #VALUE!, missing column #REF!, whole column in a scalar spot #VALUE!. Ships FALSE(), TRUE(), NA() only; families come in 0022/0023.
+
+## 2026-11-01
+
+Review rework: iterative evaluation of left-leaning operator chains (a 4,000-term + chain and an 8,000-% chain evaluate on a 2 MiB thread); Table[@Col] passes the table to the context; columns are borrowed (Cow) and ranges carry their shape; single-cell references are Arg::Ref so COUNT can tell them from literals; operators broadcast over ranges as Excel does; names are passed upper-cased; an empty top-level result shows as 0; functions can reach the context. Benchmark after rework: 100,000 row formulas in 16.3 ms. Criterion 2 unticked: the engine yields #REF!, but nothing shows a cell until formula columns (0025).

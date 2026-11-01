@@ -7,7 +7,7 @@ mod parser;
 mod value;
 
 pub use ast::{A1, BinaryOp, ErrorKind, Expr, Reference, UnaryOp};
-pub use eval::{Arg, Args, Context, Function, evaluate, function, functions};
+pub use eval::{Arg, Args, Context, Function, Range, evaluate, function, functions};
 pub use parser::{ParseError, ParseErrorKind, parse};
 pub use value::{
     Value, binary, compare, date_from_serial, general, iso_from_serial, number_from_text, round15,

@@ -4,38 +4,73 @@
 //! current row's value of a column, a whole column, a cell or range on a sheet, a name.
 //! Table formula columns, calc blocks, and the Python package each supply their own.
 
-use super::ast::{A1, ErrorKind, Expr, Reference};
+use std::borrow::Cow;
+
+use super::ast::{A1, BinaryOp, ErrorKind, Expr, Reference, UnaryOp};
 use super::value::{Value, binary, unary};
 
 /// Where a formula's references are looked up.
 pub trait Context {
-    /// `[@Col]`: this row's value of a column in the formula's own table.
-    fn this_row(&self, column: &str) -> Result<Value, ErrorKind>;
+    /// `[@Col]` or `Table[@Col]`: this row's value of a column. `table` is `None` for the
+    /// formula's own table; a context decides whether a named table is its own.
+    fn this_row(&self, table: Option<&str>, column: &str) -> Result<Value, ErrorKind>;
 
-    /// `[Col]` (own table, `table` is `None`) or `Table[Col]`: every value of a column.
-    fn column(&self, table: Option<&str>, column: &str) -> Result<Vec<Value>, ErrorKind>;
+    /// `[Col]` or `Table[Col]`: every value of a column, top to bottom. Borrowed where the
+    /// context can, so a formula that sums a column in every row does not copy it each time.
+    fn column(&self, table: Option<&str>, column: &str) -> Result<Cow<'_, [Value]>, ErrorKind>;
 
     /// `A1`. Only calc blocks have cells; a table formula referring to one is `#REF!`.
     fn cell(&self, _cell: A1) -> Result<Value, ErrorKind> {
         Err(ErrorKind::Ref)
     }
 
-    /// `A1:B2`, row by row.
-    fn range(&self, _from: A1, _to: A1) -> Result<Vec<Value>, ErrorKind> {
+    /// `A1:B2`.
+    fn range(&self, _from: A1, _to: A1) -> Result<Range<'_>, ErrorKind> {
         Err(ErrorKind::Ref)
     }
 
-    /// A defined name, such as a named LAMBDA or constant.
+    /// A defined name, passed upper-cased because Excel names ignore case.
     fn name(&self, _name: &str) -> Result<Value, ErrorKind> {
         Err(ErrorKind::Name)
     }
 }
 
-/// A function argument as the function sees it: one value, or the values of a range.
+/// A rectangle of values, row by row.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Arg {
+pub struct Range<'a> {
+    pub rows: usize,
+    pub cols: usize,
+    pub values: Cow<'a, [Value]>,
+}
+
+impl<'a> Range<'a> {
+    /// A single column, as a structured reference produces.
+    #[must_use]
+    pub fn column(values: Cow<'a, [Value]>) -> Self {
+        Self {
+            rows: values.len(),
+            cols: 1,
+            values,
+        }
+    }
+
+    /// The value at a row and column, or `None` outside the range.
+    #[must_use]
+    pub fn get(&self, row: usize, col: usize) -> Option<&Value> {
+        (row < self.rows && col < self.cols).then(|| &self.values[row * self.cols + col])
+    }
+}
+
+/// A function argument as the function sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Arg<'a> {
+    /// A value written or computed in the formula: `1`, `"a"`, `2*3`.
     Value(Value),
-    Range(Vec<Value>),
+    /// One cell reached through a reference: `A1`, `[@Qty]`. Excel treats these like
+    /// ranges in some functions, so `COUNT(A1)` skips text that `COUNT("1")` counts.
+    Ref(Value),
+    /// A range, a column, or an array computed from one (`[Qty]*2`).
+    Range(Range<'a>),
 }
 
 /// A function's arguments, evaluated only when the function asks for them, so `IF` can
@@ -45,7 +80,7 @@ pub struct Args<'a> {
     ctx: &'a dyn Context,
 }
 
-impl Args<'_> {
+impl<'a> Args<'a> {
     #[must_use]
     pub fn len(&self) -> usize {
         self.exprs.len()
@@ -62,22 +97,25 @@ impl Args<'_> {
         matches!(self.exprs.get(i), None | Some(Expr::Missing))
     }
 
-    /// Argument `i` as one value. A range where a value is wanted is `#VALUE!`; a
-    /// missing argument is `Empty`.
+    /// Argument `i` as one value. A multi-cell range where a value is wanted is
+    /// `#VALUE!`; a missing argument is `Empty`.
     #[must_use]
     pub fn value(&self, i: usize) -> Value {
-        match self.arg(i) {
-            Arg::Value(v) => v,
-            Arg::Range(_) => Value::Error(ErrorKind::Value),
-        }
+        scalar(self.arg(i))
     }
 
-    /// Argument `i` as written: a single value or a range.
+    /// Argument `i` as written: a value, a single-cell reference, or a range.
     #[must_use]
-    pub fn arg(&self, i: usize) -> Arg {
+    pub fn arg(&self, i: usize) -> Arg<'a> {
         self.exprs
             .get(i)
             .map_or(Arg::Value(Value::Empty), |e| eval_arg(e, self.ctx))
+    }
+
+    /// The context, for functions that need more than their arguments (`ROW`, `INDIRECT`).
+    #[must_use]
+    pub fn context(&self) -> &'a dyn Context {
+        self.ctx
     }
 }
 
@@ -142,53 +180,141 @@ pub fn function(name: &str) -> Option<&'static Function> {
         .map(|i| &FUNCTIONS[i])
 }
 
-/// Evaluates a formula to a single value.
+/// Evaluates a formula to the single value a cell shows. An empty result shows as 0,
+/// as in Excel (`=A1` with A1 blank).
 #[must_use]
 pub fn evaluate(expr: &Expr, ctx: &dyn Context) -> Value {
-    match eval_arg(expr, ctx) {
-        Arg::Value(v) => v,
-        // A whole range where one value is wanted. Excel would spill or intersect;
-        // neither applies to a table cell.
+    match scalar(eval_arg(expr, ctx)) {
+        Value::Empty => Value::Number(0.0),
+        v => v,
+    }
+}
+
+/// One value from an argument. A 1×1 range is its value; a larger one where one value
+/// is wanted is `#VALUE!` (Excel would spill or intersect; neither applies to a table cell).
+fn scalar(arg: Arg<'_>) -> Value {
+    match arg {
+        Arg::Value(v) | Arg::Ref(v) => v,
+        Arg::Range(r) if r.rows == 1 && r.cols == 1 => r.values[0].clone(),
         Arg::Range(_) => Value::Error(ErrorKind::Value),
     }
 }
 
-fn eval_arg(expr: &Expr, ctx: &dyn Context) -> Arg {
-    let value = |r: Result<Value, ErrorKind>| Arg::Value(r.unwrap_or_else(Value::Error));
-    let range = |r: Result<Vec<Value>, ErrorKind>| match r {
-        Ok(values) => Arg::Range(values),
-        Err(e) => Arg::Value(Value::Error(e)),
-    };
+/// A step on the left spine of an operator chain.
+enum Step<'e> {
+    Binary(BinaryOp, &'e Expr),
+    Unary(UnaryOp),
+}
+
+fn eval_arg<'a>(expr: &'a Expr, ctx: &'a dyn Context) -> Arg<'a> {
+    // `1+1+…+1` and `1%%…%` nest to the left one level per operator, deeper than the
+    // parser's nesting limit counts. Walk that spine with a loop, not recursion.
+    let mut spine = Vec::new();
+    let mut node = expr;
+    loop {
+        match node {
+            Expr::Binary { op, left, right } => {
+                spine.push(Step::Binary(*op, right));
+                node = left;
+            }
+            Expr::Unary { op, expr } => {
+                spine.push(Step::Unary(*op));
+                node = expr;
+            }
+            _ => break,
+        }
+    }
+    let mut acc = eval_leaf(node, ctx);
+    for step in spine.into_iter().rev() {
+        acc = match step {
+            Step::Binary(op, right) => apply_binary(op, acc, eval_arg(right, ctx)),
+            Step::Unary(op) => map(acc, |v| unary(op, v)),
+        };
+    }
+    acc
+}
+
+fn eval_leaf<'a>(expr: &'a Expr, ctx: &'a dyn Context) -> Arg<'a> {
+    let reference = |r: Result<Value, ErrorKind>| Arg::Ref(r.unwrap_or_else(Value::Error));
     match expr {
         Expr::Number(n) => Arg::Value(Value::number(*n)),
         Expr::Text(s) => Arg::Value(Value::Text(s.clone())),
         Expr::Bool(b) => Arg::Value(Value::Bool(*b)),
         Expr::Error(e) => Arg::Value(Value::Error(*e)),
         Expr::Missing => Arg::Value(Value::Empty),
-        Expr::Name(n) => value(ctx.name(n)),
+        Expr::Name(n) => reference(ctx.name(&n.to_uppercase())),
         Expr::Ref(Reference::Structured {
             table,
             column,
-            this_row,
-        }) => {
-            if *this_row {
-                if table.is_some() {
-                    // `Other[@Col]` names a row in a table the formula is not in.
-                    return Arg::Value(Value::Error(ErrorKind::Value));
-                }
-                value(ctx.this_row(column))
-            } else {
-                range(ctx.column(table.as_deref(), column))
-            }
-        }
-        Expr::Ref(Reference::Cell(a)) => value(ctx.cell(*a)),
-        Expr::Ref(Reference::Range(a, b)) => range(ctx.range(*a, *b)),
-        Expr::Unary { op, expr } => Arg::Value(unary(*op, &evaluate(expr, ctx))),
-        Expr::Binary { op, left, right } => {
-            Arg::Value(binary(*op, &evaluate(left, ctx), &evaluate(right, ctx)))
-        }
+            this_row: true,
+        }) => reference(ctx.this_row(table.as_deref(), column)),
+        Expr::Ref(Reference::Structured {
+            table,
+            column,
+            this_row: false,
+        }) => match ctx.column(table.as_deref(), column) {
+            Ok(values) => Arg::Range(Range::column(values)),
+            Err(e) => Arg::Value(Value::Error(e)),
+        },
+        Expr::Ref(Reference::Cell(a)) => reference(ctx.cell(*a)),
+        Expr::Ref(Reference::Range(a, b)) => match ctx.range(*a, *b) {
+            Ok(r) => Arg::Range(r),
+            Err(e) => Arg::Value(Value::Error(e)),
+        },
         Expr::Call { name, args } => Arg::Value(call(name, args, ctx)),
+        // The spine walk in eval_arg consumes these before reaching a leaf.
+        Expr::Unary { .. } | Expr::Binary { .. } => eval_arg(expr, ctx),
     }
+}
+
+/// Applies `f` to a value, or to every value of a range.
+fn map(arg: Arg<'_>, f: impl Fn(&Value) -> Value) -> Arg<'_> {
+    match arg {
+        Arg::Value(v) | Arg::Ref(v) => Arg::Value(f(&v)),
+        Arg::Range(r) => Arg::Range(Range {
+            rows: r.rows,
+            cols: r.cols,
+            values: Cow::Owned(r.values.iter().map(f).collect()),
+        }),
+    }
+}
+
+/// A binary operator, element by element when either side is a range. Shapes broadcast
+/// as in Excel: a single value or a single row or column stretches to fit; cells beyond
+/// a smaller range are `#N/A`.
+fn apply_binary<'a>(op: BinaryOp, a: Arg<'a>, b: Arg<'a>) -> Arg<'a> {
+    let as_range = |arg: Arg<'a>| match arg {
+        Arg::Range(r) => r,
+        Arg::Value(v) | Arg::Ref(v) => Range {
+            rows: 1,
+            cols: 1,
+            values: Cow::Owned(vec![v]),
+        },
+    };
+    if !matches!(a, Arg::Range(_)) && !matches!(b, Arg::Range(_)) {
+        return Arg::Value(binary(op, &scalar(a), &scalar(b)));
+    }
+    let (a, b) = (as_range(a), as_range(b));
+    let rows = a.rows.max(b.rows);
+    let cols = a.cols.max(b.cols);
+    let pick = |r: &Range<'_>, row: usize, col: usize| {
+        let row = if r.rows == 1 { 0 } else { row };
+        let col = if r.cols == 1 { 0 } else { col };
+        r.get(row, col)
+            .cloned()
+            .unwrap_or(Value::Error(ErrorKind::NA))
+    };
+    let mut values = Vec::with_capacity(rows * cols);
+    for row in 0..rows {
+        for col in 0..cols {
+            values.push(binary(op, &pick(&a, row, col), &pick(&b, row, col)));
+        }
+    }
+    Arg::Range(Range {
+        rows,
+        cols,
+        values: Cow::Owned(values),
+    })
 }
 
 fn call(name: &str, args: &[Expr], ctx: &dyn Context) -> Value {
@@ -208,31 +334,50 @@ mod tests {
     use super::*;
     use crate::formula::parse;
 
-    /// A table row in memory: column name to values, and the index of the current row.
-    struct Rows {
+    /// A table in memory, named Orders: column name to values, and the current row.
+    struct Orders {
         columns: HashMap<&'static str, Vec<Value>>,
         row: usize,
     }
 
-    impl Context for Rows {
-        fn this_row(&self, column: &str) -> Result<Value, ErrorKind> {
+    impl Orders {
+        fn own(table: Option<&str>) -> Result<(), ErrorKind> {
+            match table {
+                None | Some("Orders") => Ok(()),
+                Some(_) => Err(ErrorKind::Ref),
+            }
+        }
+    }
+
+    impl Context for Orders {
+        fn this_row(&self, table: Option<&str>, column: &str) -> Result<Value, ErrorKind> {
+            Self::own(table)?;
             self.columns
                 .get(column)
                 .map(|v| v[self.row].clone())
                 .ok_or(ErrorKind::Ref)
         }
 
-        fn column(&self, table: Option<&str>, column: &str) -> Result<Vec<Value>, ErrorKind> {
-            if table.is_some_and(|t| t != "Orders") {
-                return Err(ErrorKind::Ref);
+        fn column(&self, table: Option<&str>, column: &str) -> Result<Cow<'_, [Value]>, ErrorKind> {
+            Self::own(table)?;
+            self.columns
+                .get(column)
+                .map(|v| Cow::Borrowed(v.as_slice()))
+                .ok_or(ErrorKind::Ref)
+        }
+
+        fn name(&self, name: &str) -> Result<Value, ErrorKind> {
+            if name == "TAXRATE" {
+                Ok(Value::Number(0.25))
+            } else {
+                Err(ErrorKind::Name)
             }
-            self.columns.get(column).cloned().ok_or(ErrorKind::Ref)
         }
     }
 
-    fn orders() -> Rows {
+    fn orders() -> Orders {
         let n = |v: &[f64]| v.iter().map(|x| Value::Number(*x)).collect::<Vec<_>>();
-        Rows {
+        Orders {
             columns: HashMap::from([
                 ("Qty", n(&[2.0, 3.0])),
                 ("Price", n(&[1.5, 10.0])),
@@ -250,16 +395,32 @@ mod tests {
     fn row_formulas_use_this_rows_values() {
         let mut ctx = orders();
         assert_eq!(eval("=[@Qty]*[@Price]", &ctx), Value::Number(3.0));
+        assert_eq!(
+            eval("=Orders[@Qty]*Orders[@Price]", &ctx),
+            Value::Number(3.0),
+            "own table by name"
+        );
         ctx.row = 1;
         assert_eq!(eval("=[@Qty]*[@Price]", &ctx), Value::Number(30.0));
         assert_eq!(eval("=[@Note]&\"!\"", &ctx), Value::Text("!".into()));
+        assert_eq!(
+            eval("=[@Note]", &ctx),
+            Value::Number(0.0),
+            "an empty result shows as 0"
+        );
+        assert_eq!(
+            eval("=taxrate*4", &ctx),
+            Value::Number(1.0),
+            "names ignore case"
+        );
     }
 
     #[test]
-    fn missing_columns_are_ref_errors_and_unknown_names_are_name_errors() {
+    fn missing_things_give_excels_errors() {
         let ctx = orders();
         assert_eq!(eval("=[@Gone]+1", &ctx), Value::Error(ErrorKind::Ref));
-        assert_eq!(eval("=TaxRate*2", &ctx), Value::Error(ErrorKind::Name));
+        assert_eq!(eval("=Other[@Qty]", &ctx), Value::Error(ErrorKind::Ref));
+        assert_eq!(eval("=Unknown*2", &ctx), Value::Error(ErrorKind::Name));
         assert_eq!(
             eval("=NOSUCHFUNCTION(1)", &ctx),
             Value::Error(ErrorKind::Name)
@@ -269,7 +430,6 @@ mod tests {
             Value::Error(ErrorKind::Ref),
             "tables have no cells"
         );
-        assert_eq!(eval("=Other[@Qty]", &ctx), Value::Error(ErrorKind::Value));
     }
 
     #[test]
@@ -278,6 +438,66 @@ mod tests {
         assert_eq!(eval("=[Qty]", &ctx), Value::Error(ErrorKind::Value));
         assert_eq!(eval("=Orders[Qty]+1", &ctx), Value::Error(ErrorKind::Value));
         assert_eq!(eval("=Missing[Qty]", &ctx), Value::Error(ErrorKind::Ref));
+    }
+
+    #[test]
+    fn operators_on_columns_work_element_by_element() {
+        let ctx = orders();
+        let expr = parse("=([Qty]>2)*[Price]").unwrap();
+        let arg = eval_arg(&expr, &ctx);
+        let Arg::Range(r) = arg else {
+            panic!("a range")
+        };
+        assert_eq!((r.rows, r.cols), (2, 1));
+        assert_eq!(r.values.as_ref(), [Value::Number(0.0), Value::Number(10.0)]);
+        let short = Range::column(Cow::Owned(vec![Value::Number(1.0)]));
+        let long = Range {
+            rows: 1,
+            cols: 3,
+            values: Cow::Owned(vec![Value::Number(1.0); 3]),
+        };
+        let Arg::Range(r) = apply_binary(BinaryOp::Add, Arg::Range(short), Arg::Range(long)) else {
+            panic!("a range")
+        };
+        assert_eq!((r.rows, r.cols), (1, 3), "a single cell stretches to fit");
+        let two_rows = Range::column(Cow::Owned(vec![Value::Number(1.0); 2]));
+        let three_rows = Range::column(Cow::Owned(vec![Value::Number(1.0); 3]));
+        let Arg::Range(r) =
+            apply_binary(BinaryOp::Add, Arg::Range(two_rows), Arg::Range(three_rows))
+        else {
+            panic!("a range")
+        };
+        assert_eq!(
+            r.values[2],
+            Value::Error(ErrorKind::NA),
+            "beyond the shorter range"
+        );
+    }
+
+    #[test]
+    fn references_are_told_apart_from_literals() {
+        let ctx = orders();
+        let exprs = [
+            parse("[@Qty]").unwrap(),
+            parse("2").unwrap(),
+            parse("[Qty]").unwrap(),
+        ];
+        let args = Args {
+            exprs: &exprs,
+            ctx: &ctx,
+        };
+        assert_eq!(args.arg(0), Arg::Ref(Value::Number(2.0)));
+        assert_eq!(args.arg(1), Arg::Value(Value::Number(2.0)));
+        assert!(
+            matches!(
+                args.arg(2),
+                Arg::Range(Range {
+                    values: Cow::Borrowed(_),
+                    ..
+                })
+            ),
+            "columns are borrowed"
+        );
     }
 
     #[test]
@@ -306,20 +526,21 @@ mod tests {
     }
 
     #[test]
-    fn arguments_are_lazy() {
+    fn arguments_are_not_evaluated_until_asked_for() {
         struct Panics;
         impl Context for Panics {
-            fn this_row(&self, _: &str) -> Result<Value, ErrorKind> {
+            fn this_row(&self, _: Option<&str>, _: &str) -> Result<Value, ErrorKind> {
                 panic!("evaluated an argument nobody asked for")
             }
-            fn column(&self, _: Option<&str>, _: &str) -> Result<Vec<Value>, ErrorKind> {
+            fn column(&self, _: Option<&str>, _: &str) -> Result<Cow<'_, [Value]>, ErrorKind> {
                 panic!("evaluated an argument nobody asked for")
             }
         }
-        let expr = parse("=TRUE()").unwrap();
-        let Expr::Call { .. } = &expr else {
-            panic!("a call")
-        };
+        // Dispatch refuses the arity without touching the argument.
+        assert_eq!(
+            eval("=TRUE([@Qty])", &Panics),
+            Value::Error(ErrorKind::Value)
+        );
         let exprs = [parse("[@Qty]").unwrap()];
         let args = Args {
             exprs: &exprs,
@@ -328,7 +549,20 @@ mod tests {
         assert_eq!(args.len(), 1);
         assert!(!args.is_missing(0));
         assert!(args.is_missing(1));
-        assert_eq!(evaluate(&expr, &Panics), Value::Bool(true));
+    }
+
+    #[test]
+    fn long_operator_chains_do_not_overflow_the_stack() {
+        // Run on a thread with the default 2 MiB stack, the size test threads get.
+        std::thread::spawn(|| {
+            let ctx = orders();
+            let plus = format!("=1{}", "+1".repeat(4000));
+            assert_eq!(eval(&plus, &ctx), Value::Number(4001.0));
+            let percents = format!("=1{}", "%".repeat(8000));
+            assert_eq!(eval(&percents, &ctx), Value::Number(0.0));
+        })
+        .join()
+        .unwrap();
     }
 
     /// 100,000 row formulas of the `[@Qty]*[@Price]` kind. Run with
@@ -339,7 +573,7 @@ mod tests {
         let n = 100_000;
         let col = |f: fn(usize) -> f64| (0..n).map(|i| Value::Number(f(i))).collect();
         #[expect(clippy::cast_precision_loss, reason = "small test indices")]
-        let mut ctx = Rows {
+        let mut ctx = Orders {
             columns: HashMap::from([
                 ("Qty", col(|i| i as f64)),
                 ("Price", col(|i| i as f64 / 2.0)),
@@ -355,9 +589,12 @@ mod tests {
         }
         let elapsed = start.elapsed();
         eprintln!("{n} row formulas in {elapsed:?} (checksum {total})");
-        assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "{elapsed:?}"
-        );
+        // The budget is for optimized builds; debug builds only report.
+        if !cfg!(debug_assertions) {
+            assert!(
+                elapsed < std::time::Duration::from_millis(50),
+                "{elapsed:?}"
+            );
+        }
     }
 }
