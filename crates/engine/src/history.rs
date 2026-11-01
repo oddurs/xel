@@ -26,6 +26,7 @@ pub(crate) struct ColumnSpec {
     pub(crate) ty: ColumnType,
     pub(crate) position: i64,
     pub(crate) options: Vec<String>,
+    pub(crate) formula: Option<String>,
 }
 
 /// A table as it must be recreated.
@@ -89,6 +90,12 @@ pub(crate) enum Change {
         from: Vec<String>,
         to: Vec<String>,
     },
+    SetFormula {
+        table: TableId,
+        column: ColumnId,
+        from: String,
+        to: String,
+    },
     InsertRows {
         table: TableId,
         rows: Vec<StoredRow>,
@@ -130,6 +137,17 @@ impl Change {
             } => Self::RenameColumn {
                 table,
                 id,
+                from: to,
+                to: from,
+            },
+            Self::SetFormula {
+                table,
+                column,
+                from,
+                to,
+            } => Self::SetFormula {
+                table,
+                column,
                 from: to,
                 to: from,
             },
@@ -246,6 +264,7 @@ impl Workbook {
         for change in &changes {
             apply(&tx, change, session)?;
         }
+        crate::recalc::after(&tx, &changes)?;
         // A new edit ends redo, and the oldest undo entry may fall off the end; drop the
         // trash either was keeping, in this same transaction.
         for change in self.history.redo.iter().flatten() {
@@ -307,6 +326,7 @@ impl Workbook {
         if let Err(e) = entry
             .iter()
             .try_for_each(|change| apply(&tx, change, session))
+            .and_then(|()| crate::recalc::after(&tx, entry))
         {
             drop(tx);
             if changed_outside(&e) {
@@ -401,13 +421,15 @@ fn changed_outside(e: &Error) -> bool {
 
 fn insert_column_metadata(conn: &Connection, table: TableId, spec: &ColumnSpec) -> Result<()> {
     conn.execute(
-        "INSERT INTO xel_columns (id, table_id, name, type, position) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO xel_columns (id, table_id, name, type, position, formula) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             spec.id.0,
             table.0,
             spec.name,
             spec.ty.as_str(),
-            spec.position
+            spec.position,
+            spec.formula
         ],
     )?;
     set_options(conn, spec.id, &spec.options)
@@ -542,6 +564,12 @@ fn apply(conn: &Connection, change: &Change, session: Session) -> Result<()> {
             )?;
         }
         Change::SetOptions { column, to, .. } => set_options(conn, *column, to)?,
+        Change::SetFormula { column, to, .. } => {
+            conn.execute(
+                "UPDATE xel_columns SET formula = ?1 WHERE id = ?2",
+                params![to, column.0],
+            )?;
+        }
         Change::InsertRows { table, rows } => {
             let t = quote(&table_name(conn, *table)?);
             let names = column_names(conn, *table)?;
@@ -624,7 +652,7 @@ mod tests {
         );
         dump(
             conn,
-            "SELECT id, table_id, name, type, position FROM xel_columns ORDER BY id",
+            "SELECT id, table_id, name, type, position, formula, formula_kind FROM xel_columns ORDER BY id",
             &mut out,
         );
         dump(
@@ -952,6 +980,10 @@ mod tests {
 
     /// One random edit. Returns whether it changed anything; edits that fail validation
     /// (an option that does not exist, the last column) are allowed and change nothing.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per kind of edit reads best together"
+    )]
     fn random_edit(book: &mut Workbook, rng: &mut Rng, n: usize) {
         const TYPES: [ColumnType; 5] = [
             ColumnType::Text,
@@ -974,6 +1006,8 @@ mod tests {
             ColumnType::Select => options
                 .first()
                 .map_or(CellValue::Empty, |o| CellValue::Text(o.clone())),
+            // Writing to a formula column is refused; the test expects that error.
+            ColumnType::Formula => CellValue::Number(1.0),
         };
         let outcome = match (rng.below(11), table) {
             (0, _) | (_, None) => book
@@ -995,6 +1029,16 @@ mod tests {
                 let cols = book.table(t).unwrap().columns;
                 book.delete_column(cols[rng.below(cols.len())].id)
             }
+            (6, Some(t)) if rng.below(3) == 0 => {
+                let cols = book.table(t).unwrap().columns;
+                match cols.iter().find(|c| c.ty == ColumnType::Formula) {
+                    Some(c) => book.set_formula(c.id, &format!("=\"v{n}\"&[@a]")),
+                    None => Ok(()),
+                }
+            }
+            (6, Some(t)) if rng.below(2) == 0 => book
+                .add_formula_column(t, &format!("f{n}"), "=[@a]&\"!\"")
+                .map(|_| ()),
             (6, Some(t)) => {
                 let cols = book.table(t).unwrap().columns;
                 match cols.iter().find(|c| c.ty == ColumnType::Select) {
@@ -1037,7 +1081,12 @@ mod tests {
         // Random edits may break validation rules; anything else is a real failure.
         match outcome {
             Ok(())
-            | Err(Error::LastColumn(_) | Error::NotAnOption { .. } | Error::DuplicateName(_)) => {}
+            | Err(
+                Error::LastColumn(_)
+                | Error::NotAnOption { .. }
+                | Error::DuplicateName(_)
+                | Error::FormulaColumn(_),
+            ) => {}
             Err(e) => panic!("unexpected error: {e:?}"),
         }
     }

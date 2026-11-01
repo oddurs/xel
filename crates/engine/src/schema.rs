@@ -22,8 +22,12 @@ CREATE TABLE xel_columns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     table_id INTEGER NOT NULL REFERENCES xel_tables (id) ON DELETE CASCADE,
     name TEXT NOT NULL COLLATE NOCASE,
-    type TEXT NOT NULL CHECK (type IN ('text', 'number', 'checkbox', 'date', 'select')),
+    type TEXT NOT NULL CHECK (type IN ('text', 'number', 'checkbox', 'date', 'select', 'formula')),
     position INTEGER NOT NULL,
+    -- The formula text of a formula column; NULL for every other type.
+    formula TEXT CHECK ((type = 'formula') = (formula IS NOT NULL)),
+    -- 'date' when a formula column's results are dates, so its ISO text reads back as dates.
+    formula_kind TEXT CHECK (formula_kind IS NULL OR formula_kind = 'date'),
     UNIQUE (table_id, name)
 ) STRICT;
 CREATE TABLE xel_select_options (
@@ -65,6 +69,8 @@ pub enum ColumnType {
     Date,
     /// `TEXT` holding one of the column's options.
     Select,
+    /// Computed from a formula; `ANY`, as results can be of any type (see 0010).
+    Formula,
 }
 
 impl ColumnType {
@@ -75,6 +81,7 @@ impl ColumnType {
             Self::Checkbox => "checkbox",
             Self::Date => "date",
             Self::Select => "select",
+            Self::Formula => "formula",
         }
     }
 
@@ -85,6 +92,7 @@ impl ColumnType {
             "checkbox" => Self::Checkbox,
             "date" => Self::Date,
             "select" => Self::Select,
+            "formula" => Self::Formula,
             other => return Err(Error::Corrupt(format!("unknown column type {other:?}"))),
         })
     }
@@ -95,6 +103,7 @@ impl ColumnType {
         match self {
             Self::Text | Self::Select => format!("{quoted} TEXT"),
             Self::Number => format!("{quoted} REAL"),
+            Self::Formula => format!("{quoted} ANY"),
             Self::Checkbox => format!("{quoted} INTEGER CHECK ({quoted} IN (0, 1))"),
             Self::Date => format!(
                 // `IS`, not `=`: date() is NULL for nonsense like 2024-00-01, and a CHECK
@@ -120,6 +129,10 @@ pub struct Column {
     pub ty: ColumnType,
     /// Choices for a `Select` column, in display order; empty for other types.
     pub options: Vec<String>,
+    /// The formula of a `Formula` column, as written; `None` for other types.
+    pub formula: Option<String>,
+    /// Whether a formula column's results are dates (see `recalc`).
+    pub(crate) formula_dates: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,8 +160,11 @@ impl Workbook {
         if columns.is_empty() {
             return Err(Error::NoColumns);
         }
-        for (i, (col, _)) in columns.iter().enumerate() {
+        for (i, (col, ty)) in columns.iter().enumerate() {
             check_column_name(col)?;
+            if *ty == ColumnType::Formula {
+                return Err(Error::NeedsFormula((*col).into()));
+            }
             // SQLite identifiers are case-insensitive for ASCII only.
             if columns[..i]
                 .iter()
@@ -174,6 +190,7 @@ impl Workbook {
                     ty: *ty,
                     position: i,
                     options: Vec::new(),
+                    formula: None,
                 })
                 .collect();
             let spec = TableSpec {
@@ -227,6 +244,31 @@ impl Workbook {
 
     /// Adds a column at the end of the table.
     pub fn add_column(&mut self, table: TableId, name: &str, ty: ColumnType) -> Result<ColumnId> {
+        if ty == ColumnType::Formula {
+            return Err(Error::NeedsFormula(name.into()));
+        }
+        self.append_column(table, name, ty, None)
+    }
+
+    /// Adds a column computed by a formula, such as `=[@Qty]*[@Price]`, and computes it
+    /// for every row.
+    pub fn add_formula_column(
+        &mut self,
+        table: TableId,
+        name: &str,
+        formula: &str,
+    ) -> Result<ColumnId> {
+        check_formula(name, formula)?;
+        self.append_column(table, name, ColumnType::Formula, Some(formula.into()))
+    }
+
+    fn append_column(
+        &mut self,
+        table: TableId,
+        name: &str,
+        ty: ColumnType,
+        formula: Option<String>,
+    ) -> Result<ColumnId> {
         check_column_name(name)?;
         self.edit(|tx| {
             table_name(tx, table)?;
@@ -243,6 +285,7 @@ impl Workbook {
                 ty,
                 position,
                 options: Vec::new(),
+                formula,
             };
             Ok((
                 vec![Change::AddColumn {
@@ -251,6 +294,30 @@ impl Workbook {
                     from_trash: false,
                 }],
                 id,
+            ))
+        })
+    }
+
+    /// Replaces a formula column's formula and recomputes the column.
+    pub fn set_formula(&mut self, column: ColumnId, formula: &str) -> Result<()> {
+        self.edit(|tx| {
+            let spec = column_spec(tx, column)?;
+            let Some(from) = spec.formula else {
+                return Err(Error::NotAFormulaColumn(column));
+            };
+            check_formula(&spec.name, formula)?;
+            if from == formula {
+                return Ok((vec![], ()));
+            }
+            let table = column_info(tx, column)?.table;
+            Ok((
+                vec![Change::SetFormula {
+                    table,
+                    column,
+                    from,
+                    to: formula.into(),
+                }],
+                (),
             ))
         })
     }
@@ -354,11 +421,11 @@ fn table_spec(conn: &Connection, id: TableId) -> Result<TableSpec> {
 
 /// Everything needed to recreate a column exactly.
 fn column_spec(conn: &Connection, id: ColumnId) -> Result<ColumnSpec> {
-    let (name, ty, position): (String, String, i64) = conn
+    let (name, ty, position, formula): (String, String, i64, Option<String>) = conn
         .query_row(
-            "SELECT name, type, position FROM xel_columns WHERE id = ?1",
+            "SELECT name, type, position, formula FROM xel_columns WHERE id = ?1",
             [id.0],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?
         .ok_or(Error::NoSuchColumn(id))?;
@@ -372,13 +439,21 @@ fn column_spec(conn: &Connection, id: ColumnId) -> Result<ColumnSpec> {
         ty: ColumnType::parse(&ty)?,
         position,
         options,
+        formula,
     })
+}
+
+/// One table with its columns and options.
+pub(crate) fn load_table(conn: &Connection, id: TableId) -> Result<Table> {
+    load_tables(conn, Some(id))?
+        .pop()
+        .ok_or(Error::NoSuchTable(id))
 }
 
 /// Loads every table, or just `only`, with columns and options in one query.
 fn load_tables(conn: &Connection, only: Option<TableId>) -> Result<Vec<Table>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, c.id, c.name, c.type, o.value
+        "SELECT t.id, t.name, c.id, c.name, c.type, o.value, c.formula, c.formula_kind
          FROM xel_tables t
          LEFT JOIN xel_columns c ON c.table_id = t.id
          LEFT JOIN xel_select_options o ON o.column_id = c.id
@@ -406,6 +481,8 @@ fn load_tables(conn: &Connection, only: Option<TableId>) -> Result<Vec<Table>> {
                 name: r.get(3)?,
                 ty: ColumnType::parse(&r.get::<_, String>(4)?)?,
                 options: Vec::new(),
+                formula: r.get(6)?,
+                formula_dates: r.get::<_, Option<String>>(7)?.as_deref() == Some("date"),
             });
         }
         if let Some(option) = r.get::<_, Option<String>>(5)? {
@@ -444,6 +521,17 @@ fn check_name(name: &str) -> Result<()> {
         return invalid("a name cannot contain control characters");
     }
     Ok(())
+}
+
+/// A formula must parse; references to columns that do not exist are allowed and show
+/// `#REF!`, as in Excel.
+fn check_formula(column: &str, formula: &str) -> Result<()> {
+    crate::formula::parse(formula)
+        .map(|_| ())
+        .map_err(|error| Error::Formula {
+            column: column.into(),
+            error,
+        })
 }
 
 fn check_column_name(name: &str) -> Result<()> {

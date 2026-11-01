@@ -10,6 +10,7 @@ use crate::history::{CellChange, Change, StoredRow, next_id};
 
 use crate::cell::{CellValue, Date};
 use crate::error::{Error, Result};
+use crate::formula::Value;
 use crate::schema::{Column, ColumnId, ColumnType, ROW_ID, Table, TableId, quote};
 use crate::workbook::Workbook;
 
@@ -276,6 +277,7 @@ fn stored(col: &Column, value: &CellValue) -> Result<SqlValue> {
         found: value.kind(),
     };
     Ok(match (col.ty, value) {
+        (ColumnType::Formula, _) => return Err(Error::FormulaColumn(col.name.clone())),
         (_, CellValue::Empty) => SqlValue::Null,
         (ColumnType::Text, CellValue::Text(s)) => SqlValue::Text(s.clone()),
         (ColumnType::Number, CellValue::Number(n)) if !n.is_finite() => {
@@ -314,6 +316,18 @@ fn read_cell(col: &Column, raw: ValueRef<'_>) -> Result<CellValue> {
         ))
     };
     Ok(match (col.ty, raw) {
+        (ColumnType::Formula, raw) => {
+            match crate::recalc::formula_value(ColumnType::Formula, col.formula_dates, raw) {
+                Value::Empty => CellValue::Empty,
+                Value::Number(n) => CellValue::Number(n),
+                Value::Text(s) => CellValue::Text(s),
+                Value::Bool(b) => CellValue::Checkbox(b),
+                Value::Date(d) => {
+                    Date::from_serial(d).map_or(CellValue::Number(d), CellValue::Date)
+                }
+                Value::Error(e) => CellValue::Error(e),
+            }
+        }
         (_, ValueRef::Null) => CellValue::Empty,
         (ColumnType::Text | ColumnType::Select, ValueRef::Text(t)) => {
             CellValue::Text(String::from_utf8_lossy(t).into_owned())

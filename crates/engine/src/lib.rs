@@ -9,6 +9,7 @@ mod cell_ref;
 mod error;
 pub mod formula;
 mod history;
+mod recalc;
 mod rows;
 mod schema;
 #[cfg(test)]
