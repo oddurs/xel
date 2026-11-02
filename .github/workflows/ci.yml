@@ -27,6 +27,18 @@ jobs:
       - run: swift --version
       - run: scripts/task check
 
+  universal:
+    # Builds the universal (Apple silicon + Intel) app, which needs Xcode's build system.
+    # Not part of `required`, so it never delays a merge; a failure shows on the commit.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Also verifies the app binary has both architectures.
+      - run: XEL_UNIVERSAL=1 scripts/task build
+
   pr-title:
     # The squash merge uses the PR title as the commit subject on main.
     if: github.event_name == 'pull_request'
