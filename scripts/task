@@ -4,7 +4,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-SWIFT_SOURCES="app/Package.swift app/Sources"
+SWIFT_SOURCES="app/Package.swift app/Sources app/Tests"
 
 # Cargo's target directory, honouring CARGO_TARGET_DIR.
 cargo_target_dir() {
@@ -57,6 +57,48 @@ bindings() {
     rm -rf "$tmp"
 }
 
+# Builds the engine for this Mac and its Swift bindings, and sets lib_dir to the
+# library's directory.
+host_engine() {
+    profile_flag=""
+    if [ "$(profile)" = release ]; then
+        profile_flag="--release"
+    fi
+    cargo build --workspace --locked $profile_flag
+    lib_dir=$(cargo_target_dir)/$(profile)
+    bindings "$lib_dir/libxel_ffi.a"
+}
+
+# Removes the Swift binary at $1 when the engine library in $lib_dir is newer.
+relink_if_stale() {
+    if [ "$lib_dir/libxel_ffi.a" -nt "$1" ]; then
+        rm -f "$1"
+    fi
+}
+
+# Runs the Swift tests against the engine built for this Mac.
+swift_test() {
+    host_engine
+    prof=$(profile)
+    # Its own build directory: the test flags differ from the app's, and sharing one would
+    # make each rebuild everything the other built.
+    scratch=app/.build-tests
+    relink_if_stale "$(swift build --package-path app --scratch-path "$scratch" -c "$prof" --show-bin-path)/XelPackageTests.xctest/Contents/MacOS/XelPackageTests"
+    # Xcode finds Swift Testing itself; the Command Line Tools ship it outside the default
+    # search paths.
+    developer=$(xcode-select -p)
+    frameworks=$developer/Library/Developer/Frameworks
+    set --
+    if [ -d "$frameworks/Testing.framework" ]; then
+        set -- -Xswiftc -F -Xswiftc "$frameworks" -Xlinker -F -Xlinker "$frameworks" \
+            -Xlinker -rpath -Xlinker "$frameworks" \
+            -Xlinker -rpath -Xlinker "$developer/Library/Developer/usr/lib"
+    fi
+    XEL_ENGINE_LIB_DIR=$lib_dir \
+        swift test --package-path app --scratch-path "$scratch" -Xswiftc -warnings-as-errors \
+        -c "$prof" "$@"
+}
+
 # Builds the engine, the bindings, and the Swift app.
 build() {
     target=$(cargo_target_dir)
@@ -84,17 +126,13 @@ build() {
         bindings "$target/aarch64-apple-darwin/$prof/libxel_ffi.a"
         set -- --arch arm64 --arch x86_64
     else
-        cargo build --workspace --locked $profile_flag
-        lib_dir=$target/$prof
-        bindings "$lib_dir/libxel_ffi.a"
+        host_engine
         set --
     fi
     # SwiftPM does not track the static library as a link input; when the engine is newer
     # than the app binary, remove the binary so SwiftPM links it again.
     bin=$(swift build --package-path app -c "$prof" "$@" --show-bin-path)/Xel
-    if [ "$lib_dir/libxel_ffi.a" -nt "$bin" ]; then
-        rm -f "$bin"
-    fi
+    relink_if_stale "$bin"
     XEL_ENGINE_LIB_DIR=$lib_dir \
         swift build --package-path app -Xswiftc -warnings-as-errors -c "$prof" "$@"
     if universal; then
@@ -162,9 +200,8 @@ run() {
             swift format lint --strict --recursive $SWIFT_SOURCES
             ;;
         test)
-            # The Swift app has no tests yet; XCTest needs full Xcode, so Swift tests
-            # arrive with the first app logic worth testing.
             cargo test --workspace --locked
+            swift_test
             ;;
         build)
             build
