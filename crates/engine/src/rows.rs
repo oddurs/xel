@@ -48,6 +48,26 @@ pub struct Row {
 }
 
 impl Workbook {
+    /// Each column's total, in column order: `None` for a column without one. A table
+    /// shows a total row when any column has a total.
+    pub fn totals(&self, table: TableId) -> Result<Vec<Option<CellValue>>> {
+        // Reports a missing table, which the query below would not.
+        crate::schema::table_name(&self.conn, table)?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT total IS NOT NULL, total_value, total_kind FROM xel_columns \
+             WHERE table_id = ?1 ORDER BY position, id",
+        )?;
+        let mut rows = stmt.query([table.0])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let has_total: bool = r.get(0)?;
+            let dates = r.get_ref(2)?.as_str_or_null().ok().flatten() == Some("date");
+            let raw = r.get_ref(1)?;
+            out.push(has_total.then(|| computed(raw, dates)));
+        }
+        Ok(out)
+    }
+
     pub fn row_count(&self, table: TableId) -> Result<u64> {
         let t = self.table(table)?;
         let n: i64 = self
@@ -318,6 +338,19 @@ fn stored(col: &Column, value: &CellValue) -> Result<SqlValue> {
     })
 }
 
+/// A stored formula result, or total, as a cell. `dates` says whether its ISO text is a
+/// date.
+fn computed(raw: ValueRef<'_>, dates: bool) -> CellValue {
+    match crate::recalc::formula_value(ColumnType::Formula, dates, raw) {
+        Value::Empty => CellValue::Empty,
+        Value::Number(n) => CellValue::Number(n),
+        Value::Text(s) => CellValue::Text(s),
+        Value::Bool(b) => CellValue::Checkbox(b),
+        Value::Date(d) => Date::from_serial(d).map_or(CellValue::Number(d), CellValue::Date),
+        Value::Error(e) => CellValue::Error(e),
+    }
+}
+
 /// Converts a stored value back, according to the column's type.
 fn read_cell(col: &Column, raw: ValueRef<'_>) -> Result<CellValue> {
     let corrupt = || {
@@ -327,18 +360,7 @@ fn read_cell(col: &Column, raw: ValueRef<'_>) -> Result<CellValue> {
         ))
     };
     Ok(match (col.ty, raw) {
-        (ColumnType::Formula, raw) => {
-            match crate::recalc::formula_value(ColumnType::Formula, col.formula_dates, raw) {
-                Value::Empty => CellValue::Empty,
-                Value::Number(n) => CellValue::Number(n),
-                Value::Text(s) => CellValue::Text(s),
-                Value::Bool(b) => CellValue::Checkbox(b),
-                Value::Date(d) => {
-                    Date::from_serial(d).map_or(CellValue::Number(d), CellValue::Date)
-                }
-                Value::Error(e) => CellValue::Error(e),
-            }
-        }
+        (ColumnType::Formula, raw) => computed(raw, col.formula_dates),
         (_, ValueRef::Null) => CellValue::Empty,
         (ColumnType::Text | ColumnType::Select, ValueRef::Text(t)) => {
             CellValue::Text(String::from_utf8_lossy(t).into_owned())

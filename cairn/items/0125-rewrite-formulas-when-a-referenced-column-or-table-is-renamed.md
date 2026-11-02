@@ -28,3 +28,7 @@ Add a formula printer (AST back to Excel text, with minimal parentheses), and on
 - [ ] Renaming a table referenced by name rewrites `Orders[...]` references, covered by a test
 - [ ] Printing then parsing any formula in the parser's corpus gives the same AST, covered by a round-trip test
 - [ ] Undo of the rename restores the old names in both the column and the formulas
+
+## 2026-11-01
+
+Totals (0026) reference columns by name too: renaming a column must rewrite xel_columns.total formulas as well as formula columns.

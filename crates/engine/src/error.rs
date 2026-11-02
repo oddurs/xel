@@ -70,6 +70,10 @@ pub enum Error {
     NeedsFormula(String),
     #[error("column {0:?} is computed by a formula and cannot be edited")]
     FormulaColumn(String),
+    #[error(
+        "the total of column {0:?} must read whole columns, such as [Amount], not a single row, a name, or a volatile function"
+    )]
+    NotATotal(String),
     #[error("column {} is not a formula column", .0.raw())]
     NotAFormulaColumn(ColumnId),
     #[error("database error: {0}")]

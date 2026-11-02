@@ -20,5 +20,5 @@ pub use cell::{CellValue, Date};
 pub use cell_ref::{CellRef, ParseCellRefError};
 pub use error::{Error, Result};
 pub use rows::{Row, RowId};
-pub use schema::{Column, ColumnId, ColumnType, Table, TableId};
+pub use schema::{Aggregate, Column, ColumnId, ColumnType, Table, TableId};
 pub use workbook::{FORMAT_VERSION, Workbook};

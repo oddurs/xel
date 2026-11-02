@@ -27,6 +27,7 @@ pub(crate) struct ColumnSpec {
     pub(crate) position: i64,
     pub(crate) options: Vec<String>,
     pub(crate) formula: Option<String>,
+    pub(crate) total: Option<String>,
 }
 
 /// A table as it must be recreated.
@@ -96,6 +97,12 @@ pub(crate) enum Change {
         from: String,
         to: String,
     },
+    SetTotal {
+        table: TableId,
+        column: ColumnId,
+        from: Option<String>,
+        to: Option<String>,
+    },
     InsertRows {
         table: TableId,
         rows: Vec<StoredRow>,
@@ -146,6 +153,17 @@ impl Change {
                 from,
                 to,
             } => Self::SetFormula {
+                table,
+                column,
+                from: to,
+                to: from,
+            },
+            Self::SetTotal {
+                table,
+                column,
+                from,
+                to,
+            } => Self::SetTotal {
                 table,
                 column,
                 from: to,
@@ -429,15 +447,16 @@ fn changed_outside(e: &Error) -> bool {
 
 fn insert_column_metadata(conn: &Connection, table: TableId, spec: &ColumnSpec) -> Result<()> {
     conn.execute(
-        "INSERT INTO xel_columns (id, table_id, name, type, position, formula) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO xel_columns (id, table_id, name, type, position, formula, total) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             spec.id.0,
             table.0,
             spec.name,
             spec.ty.as_str(),
             spec.position,
-            spec.formula
+            spec.formula,
+            spec.total,
         ],
     )?;
     set_options(conn, spec.id, &spec.options)
@@ -578,6 +597,14 @@ fn apply(conn: &Connection, change: &Change, session: Session) -> Result<()> {
                 params![to, column.0],
             )?;
         }
+        // recalc computes the new result.
+        Change::SetTotal { column, to, .. } => {
+            conn.execute(
+                "UPDATE xel_columns SET total = ?1, total_value = NULL, total_kind = NULL \
+                 WHERE id = ?2",
+                params![to, column.0],
+            )?;
+        }
         Change::InsertRows { table, rows } => {
             let t = quote(&table_name(conn, *table)?);
             let names = column_names(conn, *table)?;
@@ -660,7 +687,8 @@ mod tests {
         );
         dump(
             conn,
-            "SELECT id, table_id, name, type, position, formula, formula_kind FROM xel_columns ORDER BY id",
+            "SELECT id, table_id, name, type, position, formula, formula_kind, total, total_value, \
+             total_kind FROM xel_columns ORDER BY id",
             &mut out,
         );
         dump(
@@ -1024,6 +1052,20 @@ mod tests {
                     &[("a", TYPES[rng.below(5)]), ("b", TYPES[rng.below(5)])],
                 )
                 .map(|_| ()),
+            (1, Some(t)) if rng.below(2) == 0 => {
+                let cols = book.table(t).unwrap().columns;
+                let c = &cols[rng.below(cols.len())];
+                match rng.pick(&[
+                    crate::schema::Aggregate::Sum,
+                    crate::schema::Aggregate::Count,
+                    crate::schema::Aggregate::Min,
+                ]) {
+                    Some(kind) if rng.below(4) > 0 => {
+                        book.set_total(c.id, Some(&kind.formula(&c.name)))
+                    }
+                    _ => book.set_total(c.id, None),
+                }
+            }
             (1, Some(t)) => book.rename_table(t, &format!("R{n}")),
             (2, Some(t)) if rng.below(3) == 0 => book.delete_table(t),
             (3, Some(t)) => book
