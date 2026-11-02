@@ -21,6 +21,9 @@ let package = Package(
                 .linkedLibrary("xel_ffi"),
             ]
         ),
-        .executableTarget(name: "Xel", dependencies: ["XelEngine"]),
+        // The app's interface to the engine: runs it off the main thread and reports changes.
+        .target(name: "XelKit", dependencies: ["XelEngine"]),
+        .executableTarget(name: "Xel", dependencies: ["XelKit"]),
+        .testTarget(name: "XelKitTests", dependencies: ["XelKit", "XelEngine"]),
     ]
 )

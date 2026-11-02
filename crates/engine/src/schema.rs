@@ -56,6 +56,32 @@ pub struct TableId(pub(crate) i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ColumnId(pub(crate) i64);
 
+// The raw ids let a caller across a language boundary hold on to tables and columns. Any
+// id is safe to pass back: the engine looks it up and reports one that does not exist.
+impl TableId {
+    #[must_use]
+    pub const fn from_raw(id: i64) -> Self {
+        Self(id)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> i64 {
+        self.0
+    }
+}
+
+impl ColumnId {
+    #[must_use]
+    pub const fn from_raw(id: i64) -> Self {
+        Self(id)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> i64 {
+        self.0
+    }
+}
+
 /// What a column holds, and so how it is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColumnType {

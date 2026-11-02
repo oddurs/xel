@@ -23,9 +23,20 @@ pub struct RowId {
 }
 
 impl RowId {
+    /// The row `id` of `table`, as `raw` returned it. The engine looks it up when used.
+    #[must_use]
+    pub const fn new(table: TableId, id: i64) -> Self {
+        Self { table, id }
+    }
+
     #[must_use]
     pub fn table(self) -> TableId {
         self.table
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> i64 {
+        self.id
     }
 }
 
