@@ -14,33 +14,92 @@ cargo_target_dir() {
 
 # The build profile: XEL_PROFILE=release for release builds, debug otherwise.
 profile() {
-    echo "${XEL_PROFILE:-debug}"
+    case "${XEL_PROFILE:-debug}" in
+        debug | release) echo "${XEL_PROFILE:-debug}" ;;
+        *)
+            echo "task: XEL_PROFILE must be debug or release, not '$XEL_PROFILE'" >&2
+            exit 2
+            ;;
+    esac
 }
 
-# Where cargo writes the host build of the engine's static library.
-engine_lib_dir() {
-    echo "$(cargo_target_dir)/$(profile)"
+# Whether to build for Apple silicon and Intel: XEL_UNIVERSAL=1.
+universal() {
+    case "${XEL_UNIVERSAL:-0}" in
+        0) return 1 ;;
+        1) return 0 ;;
+        *)
+            echo "task: XEL_UNIVERSAL must be 0 or 1, not '$XEL_UNIVERSAL'" >&2
+            exit 2
+            ;;
+    esac
 }
 
-# Generates the Swift bindings for the engine from the built static library. SwiftPM
+# Copies $1 over $2 only if they differ, so unchanged outputs keep their timestamps.
+place() {
+    if ! cmp -s "$1" "$2"; then
+        cp "$1" "$2"
+    fi
+}
+
+# Generates the Swift bindings for the engine from the static library at $1. SwiftPM
 # needs them laid out as a C module (header and module map) and a Swift target. Files are
 # replaced only when they change, so SwiftPM does not recompile them on every build.
 bindings() {
-    lib=$(engine_lib_dir)/libxel_ffi.a
     out=app/Generated
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/xel-bindings.XXXXXX")
     cargo run --quiet --locked --manifest-path tools/uniffi-bindgen/Cargo.toml -- \
-        generate --library "$lib" --language swift --out-dir "$tmp"
+        generate --library "$1" --language swift --out-dir "$tmp"
     mkdir -p "$out/xel_ffiFFI" "$out/XelEngine"
-    place() {
-        if ! cmp -s "$1" "$2"; then
-            cp "$1" "$2"
-        fi
-    }
     place "$tmp/xel_ffiFFI.h" "$out/xel_ffiFFI/xel_ffiFFI.h"
     place "$tmp/xel_ffiFFI.modulemap" "$out/xel_ffiFFI/module.modulemap"
     place "$tmp/xel_ffi.swift" "$out/XelEngine/xel_ffi.swift"
     rm -rf "$tmp"
+}
+
+# Builds the engine, the bindings, and the Swift app.
+build() {
+    target=$(cargo_target_dir)
+    prof=$(profile)
+    profile_flag=""
+    if [ "$prof" = release ]; then
+        profile_flag="--release"
+    fi
+    if universal; then
+        # SwiftPM needs Xcode's build system for more than one architecture, so this
+        # works where Xcode is installed (CI), not with the Command Line Tools alone.
+        rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
+        for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build -p xel-ffi --locked $profile_flag --target "$triple"
+        done
+        lib_dir=$target/universal/$prof
+        mkdir -p "$lib_dir"
+        fat=$(mktemp "${TMPDIR:-/tmp}/xel-universal.XXXXXX")
+        lipo -create \
+            "$target/aarch64-apple-darwin/$prof/libxel_ffi.a" \
+            "$target/x86_64-apple-darwin/$prof/libxel_ffi.a" \
+            -output "$fat"
+        place "$fat" "$lib_dir/libxel_ffi.a"
+        rm -f "$fat"
+        bindings "$target/aarch64-apple-darwin/$prof/libxel_ffi.a"
+        set -- --arch arm64 --arch x86_64
+    else
+        cargo build --workspace --locked $profile_flag
+        lib_dir=$target/$prof
+        bindings "$lib_dir/libxel_ffi.a"
+        set --
+    fi
+    # SwiftPM does not track the static library as a link input; when the engine is newer
+    # than the app binary, remove the binary so SwiftPM links it again.
+    bin=$(swift build --package-path app -c "$prof" "$@" --show-bin-path)/Xel
+    if [ "$lib_dir/libxel_ffi.a" -nt "$bin" ]; then
+        rm -f "$bin"
+    fi
+    XEL_ENGINE_LIB_DIR=$lib_dir \
+        swift build --package-path app -Xswiftc -warnings-as-errors -c "$prof" "$@"
+    if universal; then
+        lipo "$bin" -verify_arch arm64 x86_64
+    fi
 }
 
 swift_fmt_check() {
@@ -75,33 +134,7 @@ run() {
             cargo test --workspace --locked
             ;;
         build)
-            profile_flag=""
-            if [ "$(profile)" = release ]; then
-                profile_flag="--release"
-            fi
-            cargo build --workspace --locked $profile_flag
-            bindings
-            lib_dir=$(engine_lib_dir)
-            arch_flags=""
-            # XEL_UNIVERSAL=1 builds for Apple silicon and Intel and links a universal app.
-            # SwiftPM needs Xcode's build system for more than one architecture, so local
-            # builds with only the Command Line Tools stay host-only.
-            if [ "${XEL_UNIVERSAL:-0}" = 1 ]; then
-                target=$(cargo_target_dir)
-                lib_dir=$target/universal/$(profile)
-                mkdir -p "$lib_dir"
-                for triple in aarch64-apple-darwin x86_64-apple-darwin; do
-                    cargo build -p xel-ffi --locked $profile_flag --target "$triple"
-                done
-                lipo -create \
-                    "$target/aarch64-apple-darwin/$(profile)/libxel_ffi.a" \
-                    "$target/x86_64-apple-darwin/$(profile)/libxel_ffi.a" \
-                    -output "$lib_dir/libxel_ffi.a"
-                arch_flags="--arch arm64 --arch x86_64"
-            fi
-            XEL_ENGINE_LIB_DIR=$lib_dir \
-                swift build --package-path app -Xswiftc -warnings-as-errors \
-                -c "$(profile)" $arch_flags
+            build
             ;;
         check)
             run fmt:check
