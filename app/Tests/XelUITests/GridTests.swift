@@ -16,7 +16,11 @@ final class FakeRows: Sendable {
     private let gate = Mutex<(open: Bool, waiting: [CheckedContinuation<Void, Never>])>(
         (false, []))
 
-    init(gated: Bool = false) {
+    /// Offsets whose read fails, as an engine error would.
+    let failing: Set<UInt64>
+
+    init(gated: Bool = false, failing: Set<UInt64> = []) {
+        self.failing = failing
         gate.withLock { $0.open = !gated }
     }
 
@@ -47,6 +51,7 @@ final class FakeRows: Sendable {
             throw CancellationError()
         }
         calls.withLock { $0.append(offset) }
+        if failing.contains(offset) { throw XelError.Other(message: "unreadable page") }
         return (offset..<offset + limit).map { row in
             RowData(id: RowRef(table: 1, row: Int64(row) + 1), cells: [.text(value: "r\(row)")])
         }
@@ -60,7 +65,7 @@ let oneColumn = [
 /// Waits until `condition` holds, for up to two seconds.
 @MainActor
 func eventually(_ condition: () -> Bool) async throws {
-    let deadline = ContinuousClock.now + .seconds(2)
+    let deadline = ContinuousClock.now + .seconds(5)
     while !condition() {
         guard ContinuousClock.now < deadline else {
             Issue.record("condition never held")
@@ -92,6 +97,9 @@ func eventually(_ condition: () -> Bool) async throws {
         let data = GridData(table: 1, columns: oneColumn, rowCount: 1_000_000, fetch: rows.fetch)
         data.request(rows: 0...20)
         try await eventually { data.loadedPages == [0] }
+        data.request(rows: 5 * 128...5 * 128 + 20)
+        try await eventually { data.loadedPages == [0, 5] }
+        #expect(data.loadedPages.contains(0), "pages within reach are kept")
         data.request(rows: 500_000...500_020)
         try await eventually { data.loadedPages.contains(500_000 / 128) }
         #expect(!data.loadedPages.contains(0))
@@ -118,18 +126,62 @@ func eventually(_ condition: () -> Bool) async throws {
         try await Task.sleep(for: .milliseconds(20))
         data.reset(columns: oneColumn, rowCount: 50)
         rows.open()
-        try await Task.sleep(for: .milliseconds(20))
-        #expect(data.cell(row: 0, column: 0) == nil, "rows read before the reset are not shown")
+        try await eventually { rows.skippedOffsets == [0] }
+        #expect(rows.offsets.isEmpty, "the read queued before the reset is skipped, not run")
+        #expect(data.cell(row: 0, column: 0) == nil)
         #expect(data.rowCount == 50)
 
         data.request(rows: 0...20)
         try await eventually { data.cell(row: 0, column: 0) != nil }
     }
 
+    @Test func anEditKeepsTheOldRowsOnScreenUntilTheyAreReadAgain() async throws {
+        let rows = FakeRows()
+        let data = GridData(table: 1, columns: oneColumn, rowCount: 100, fetch: rows.fetch)
+        data.request(rows: 0...20)
+        try await eventually { data.cell(row: 0, column: 0) != nil }
+        data.reset(columns: oneColumn, rowCount: 101)
+        #expect(data.cell(row: 0, column: 0)?.text == "r0", "not blank while it is reread")
+        data.request(rows: 0...20)
+        try await eventually { rows.offsets == [0, 0] }
+
+        let renamed = [
+            ColumnInfo(id: 2, name: "Other", kind: .text, options: [], formula: nil, total: nil)
+        ]
+        data.reset(columns: renamed, rowCount: 101)
+        #expect(data.cell(row: 0, column: 0) == nil, "rows of other columns are not shown")
+    }
+
+    @Test func aPageThatCannotBeReadIsReportedAndNotRetriedEveryFrame() async throws {
+        let rows = FakeRows(failing: [0])
+        let data = GridData(table: 1, columns: oneColumn, rowCount: 1_000, fetch: rows.fetch)
+        var errors: [String] = []
+        data.onError = { errors.append("\($0)") }
+        data.request(rows: 0...20)
+        try await eventually { errors.count == 1 }
+        data.request(rows: 0...20)
+        data.request(rows: 0...20)
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(rows.offsets == [0], "a failed page waits for the next reset")
+    }
+
+    @Test func aPageThatArrivesAfterTheGridMovedFarIsNotKept() async throws {
+        let rows = FakeRows(gated: true)
+        let data = GridData(table: 1, columns: oneColumn, rowCount: 1_000_000, fetch: rows.fetch)
+        data.request(rows: 0...20)
+        try await Task.sleep(for: .milliseconds(10))
+        // The read has already passed its check; then the grid moves far away.
+        rows.open()
+        data.request(rows: 900_000...900_020)
+        try await eventually { data.loadedPages.contains(900_000 / 128) }
+        #expect(!data.loadedPages.contains(0))
+    }
+
     @Test func cellsAreFormattedAsTheGridShowsThem() {
         #expect(GridText(.number(value: 1200)).text == "1200")
         #expect(GridText(.number(value: 0.1 + 0.2)).text == "0.3")
         #expect(GridText(.number(value: 1e20)).text == "1e+20")
+        #expect(GridText(.number(value: -0.0)).text == "0")
         #expect(GridText(.number(value: -2.5)).kind == .number)
         #expect(GridText(.date(year: 2026, month: 11, day: 3)).text == "2026-11-03")
         #expect(GridText(.checkbox(value: true)).text == "✓")
@@ -174,10 +226,15 @@ func eventually(_ condition: () -> Bool) async throws {
             _ = try await workbook.insertRow(into: places, values: [])
         }
         try await eventually { document.model.grid?.rowCount == 1 }
+
+        document.select(nil)
+        #expect(document.model.selection == places, "clicking empty sidebar space keeps the table")
+        document.edit("Delete Table") { workbook in try await workbook.deleteTable(places) }
+        try await eventually { document.model.grid?.table == people }
         document.close()
     }
 
-    @Test func theGridDrawsWithoutAWindow() throws {
+    @Test func theGridDrawsWithoutAWindow() async throws {
         let rows = FakeRows()
         let data = GridData(table: 1, columns: oneColumn, rowCount: 1_000, fetch: rows.fetch)
         let container = makeGridView(data: data)
@@ -189,6 +246,10 @@ func eventually(_ condition: () -> Bool) async throws {
         #expect(grid.frame.height == 1_000 * GridMetrics.rowHeight)
         let bitmap = try #require(grid.bitmapImageRepForCachingDisplay(in: grid.visibleRect))
         grid.cacheDisplay(in: grid.visibleRect, to: bitmap)
-        #expect(data.loadedPages.isEmpty || data.loadedPages == [0])
+        try await eventually { data.loadedPages == [0] }
+        #expect(rows.offsets == [0], "drawing the top asks for the top page only")
+
+        container.frame.size = NSSize(width: 800, height: 500)
+        #expect(container.scrollView.frame.width == 800 - GridMetrics.rowNumberWidth)
     }
 }

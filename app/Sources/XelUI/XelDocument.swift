@@ -145,7 +145,7 @@ public final class XelDocument: NSDocument {
     /// grid already showing it keeps its scroll position and reloads its rows. With
     /// `onlyIf`, only when that table is the one shown.
     private nonisolated func refreshGrid(
-        from workbook: Workbook, generation: Int, onlyIf changed: Int64?
+        from workbook: Workbook, generation: Int, onlyIf changed: Int64?, retry: Bool = true
     ) async {
         guard let table = await MainActor.run(body: { self.model.selection }),
             changed == nil || changed == table
@@ -174,9 +174,16 @@ public final class XelDocument: NSDocument {
         } catch XelError.Closed {
             // The document closed while this read waited its turn.
         } catch let error as XelError {
-            // The table went away between the selection and the read: show what is left.
-            if case .Gone = error {
-                await load(from: workbook, generation: generation)
+            // The table went away between the selection and the read: show another, once.
+            if case .Gone = error, retry {
+                await MainActor.run {
+                    if self.model.selection == table {
+                        self.model.selection = self.model.tables.first { $0.id != table }?.id
+                    }
+                }
+                await refreshGrid(from: workbook, generation: generation, onlyIf: nil, retry: false)
+            } else if case .Gone = error {
+                await MainActor.run { self.model.grid = nil }
             } else {
                 await MainActor.run { report(error) }
             }
@@ -188,7 +195,7 @@ public final class XelDocument: NSDocument {
     private func makeGrid(
         _ table: Int64, info: TableInfo, rowCount: Int, on workbook: Workbook
     ) -> GridData {
-        GridData(table: table, columns: info.columns, rowCount: rowCount) {
+        let grid = GridData(table: table, columns: info.columns, rowCount: rowCount) {
             [operations] offset, limit, stillWanted in
             try await operations.run {
                 // A grid scrolled far away no longer needs this page; skip the read.
@@ -196,11 +203,17 @@ public final class XelDocument: NSDocument {
                 return try await workbook.rows(of: table, offset: offset, limit: limit)
             }
         }
+        grid.onError = { [weak self] error in
+            if case XelError.Closed? = error as? XelError { return }
+            self?.report(error)
+        }
+        return grid
     }
 
     /// Shows `table` in the grid.
     func select(_ table: Int64?) {
-        guard model.selection != table else { return }
+        // Clicking the sidebar's empty space deselects; keep showing the table instead.
+        guard let table, model.selection != table else { return }
         model.selection = table
         guard let workbook else { return }
         let generation = generation
@@ -293,8 +306,8 @@ public final class XelDocument: NSDocument {
         if let window = windowControllers.first?.window {
             presentError(error, modalFor: window, delegate: nil, didPresent: nil, contextInfo: nil)
         } else {
-            Self.log.error(
-                "\(self.displayName ?? "a document", privacy: .public): \(error, privacy: .public)")
+            // Error messages can name the user's tables and columns.
+            Self.log.error("an error with no window to show it on: \(error, privacy: .private)")
         }
     }
 

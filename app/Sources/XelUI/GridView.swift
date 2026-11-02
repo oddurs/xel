@@ -20,8 +20,12 @@ enum GridMetrics {
 public final class GridView: NSView {
     public var data: GridData? {
         didSet {
+            // The old table's reads still in flight must not redraw this grid.
+            if oldValue !== data { oldValue?.onChange = nil }
             data?.onChange = { [weak self] rows in self?.changed(rows) }
             relayout()
+            // Another table starts at its top, not where the last one was scrolled to.
+            if oldValue?.table != data?.table { scroll(.zero) }
         }
     }
 
@@ -100,16 +104,22 @@ public final class GridView: NSView {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: GridMetrics.font, .foregroundColor: color.cgColor,
         ]
+        let room = rect.width - 2 * GridMetrics.padding
         var line = CTLineCreateWithAttributedString(
             NSAttributedString(string: cell.text, attributes: attributes))
-        let room = rect.width - 2 * GridMetrics.padding
-        var width = CTLineGetTypographicBounds(line, nil, nil, nil)
-        if width > room {
-            let ellipsis = CTLineCreateWithAttributedString(
-                NSAttributedString(string: "…", attributes: attributes))
-            line = CTLineCreateTruncatedLine(line, room, .end, ellipsis) ?? line
-            width = min(width, room)
+        if CTLineGetTypographicBounds(line, nil, nil, nil) > room {
+            if cell.kind == .number {
+                // A cut-off number reads as a different number; show that it does not fit,
+                // as Excel does.
+                line = CTLineCreateWithAttributedString(
+                    NSAttributedString(string: "###", attributes: attributes))
+            } else {
+                let ellipsis = CTLineCreateWithAttributedString(
+                    NSAttributedString(string: "…", attributes: attributes))
+                line = CTLineCreateTruncatedLine(line, room, .end, ellipsis) ?? line
+            }
         }
+        let width = CTLineGetTypographicBounds(line, nil, nil, nil)
         let x: CGFloat =
             switch cell.kind {
             case .number: rect.maxX - GridMetrics.padding - width
@@ -158,7 +168,8 @@ final class ColumnHeader: NSView {
         guard let grid, let data = grid.data, !data.columns.isEmpty,
             let context = NSGraphicsContext.current?.cgContext
         else { return }
-        let offset = grid.visibleRect.minX
+        // The clip view's origin, which goes past the edges while it bounces.
+        let offset = grid.enclosingScrollView?.contentView.bounds.minX ?? grid.visibleRect.minX
         let columns = GridView.range(
             offset, offset + bounds.width, step: GridMetrics.columnWidth, count: data.columns.count)
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
@@ -195,7 +206,7 @@ final class RowNumbers: NSView {
         guard let grid, let data = grid.data, data.rowCount > 0,
             let context = NSGraphicsContext.current?.cgContext
         else { return }
-        let offset = grid.visibleRect.minY
+        let offset = grid.enclosingScrollView?.contentView.bounds.minY ?? grid.visibleRect.minY
         let rows = GridView.range(
             offset, offset + bounds.height, step: GridMetrics.rowHeight, count: data.rowCount)
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
@@ -260,6 +271,15 @@ public final class GridContainer: NSView {
 
     override public func layout() {
         super.layout()
+        placeChildren()
+    }
+
+    /// Resizing a view without constraints resizes its subviews rather than laying it out.
+    override public func resizeSubviews(withOldSize oldSize: NSSize) {
+        placeChildren()
+    }
+
+    private func placeChildren() {
         let top = GridMetrics.headerHeight
         let left = GridMetrics.rowNumberWidth
         header.frame = NSRect(x: left, y: 0, width: max(0, bounds.width - left), height: top)

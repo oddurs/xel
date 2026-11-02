@@ -38,6 +38,9 @@ struct DocumentView: View {
         } detail: {
             if let grid = model.grid {
                 GridRepresentable(data: grid)
+            } else if !model.tables.isEmpty {
+                // The selected table is being read.
+                Color(nsColor: .textBackgroundColor)
             } else {
                 ContentUnavailableView {
                     Label("No Tables", systemImage: "tablecells")

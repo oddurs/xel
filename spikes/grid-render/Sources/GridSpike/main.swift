@@ -340,13 +340,25 @@ nonisolated(unsafe) var benchContainer: NSView?
 if args[1] == "xel", let file = ProcessInfo.processInfo.environment["XEL_BENCH_FILE"] {
     let opened = DispatchSemaphore(value: 0)
     nonisolated(unsafe) var result: (Workbook, TableInfo, UInt64)?
+    nonisolated(unsafe) var failure: (any Error)?
     Task.detached {
-        let book = try await Workbook.open(URL(filePath: file))
-        let table = try await book.tables()[0]
-        result = (book, table, try await book.rowCount(of: table.id))
-        opened.signal()
+        defer { opened.signal() }
+        do {
+            let book = try await Workbook.open(URL(filePath: file))
+            guard let table = try await book.tables().first else {
+                failure = CocoaError(.fileReadCorruptFile)
+                return
+            }
+            result = (book, table, try await book.rowCount(of: table.id))
+        } catch {
+            failure = error
+        }
     }
     opened.wait()
+    if let failure {
+        FileHandle.standardError.write(Data("GridSpike: cannot open \(file): \(failure)\n".utf8))
+        exit(1)
+    }
     MainActor.assumeIsolated {
         guard let (book, table, count) = result else { exit(1) }
         benchData = GridData(table: table.id, columns: table.columns, rowCount: Int(count)) {
