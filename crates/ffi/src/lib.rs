@@ -541,17 +541,45 @@ impl Book {
 mod tests {
     use super::*;
 
-    fn temp_path(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("xel-ffi-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir is writable");
-        let path = dir.join(name);
-        let _ = std::fs::remove_file(&path);
-        path.to_string_lossy().into_owned()
+    /// A directory for one test, removed when the test ends.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("xel-ffi-test-{}-{test}", std::process::id()));
+            std::fs::create_dir(&dir).expect("a fresh directory per test and process");
+            Self(dir)
+        }
+
+        fn file(&self, name: &str) -> String {
+            self.0.join(name).to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // Drop cannot return an error; report it rather than leave the test silent.
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                eprintln!("cannot remove {}: {e}", self.0.display());
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_directories_are_removed() {
+        let dir = {
+            let scratch = Scratch::new("removed");
+            std::fs::write(scratch.file("x.xel"), b"x").unwrap();
+            scratch.0.clone()
+        };
+        assert!(!dir.exists());
     }
 
     #[test]
     fn create_reopen_and_read_back() {
-        let path = temp_path("round-trip.xel");
+        let scratch = Scratch::new("round-trip");
+        let path = scratch.file("round-trip.xel");
         let book = Book::create(&path).unwrap();
         book.create_table(
             "From Rust",
@@ -578,7 +606,8 @@ mod tests {
             Book::open("/etc/hosts"),
             Err(XelError::NotAWorkbook { .. })
         ));
-        let path = temp_path("kinds.xel");
+        let scratch = Scratch::new("kinds");
+        let path = scratch.file("kinds.xel");
         let book = Book::create(&path).unwrap();
         assert!(matches!(
             book.create_table("xel_bad", vec![]),
@@ -590,7 +619,8 @@ mod tests {
 
     #[test]
     fn a_closed_book_refuses_further_calls() {
-        let path = temp_path("closed.xel");
+        let scratch = Scratch::new("closed");
+        let path = scratch.file("closed.xel");
         let book = Book::create(&path).unwrap();
         book.close().unwrap();
         assert_eq!(book.tables().map(|_| ()), Err(XelError::Closed));
@@ -599,7 +629,8 @@ mod tests {
 
     #[test]
     fn a_panic_poisons_the_book_instead_of_continuing() {
-        let path = temp_path("poisoned.xel");
+        let scratch = Scratch::new("poisoned");
+        let path = scratch.file("poisoned.xel");
         let book = Book::create(&path).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _: Result<(), XelError> = book.with(|_| panic!("a bug inside an engine call"));
