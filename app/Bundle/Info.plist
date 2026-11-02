@@ -22,6 +22,8 @@
 	<string>26.0</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
@@ -33,9 +35,11 @@
 			<string>Xel Workbook</string>
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
-			<!-- None until the app can open documents (0031); then Owner. -->
 			<key>LSHandlerRank</key>
-			<string>None</string>
+			<string>Owner</string>
+			<!-- The Objective-C name XelDocument gives itself with @objc. -->
+			<key>NSDocumentClass</key>
+			<string>XelDocument</string>
 			<key>LSItemContentTypes</key>
 			<array>
 				<string>io.github.oddurs.xel.workbook</string>

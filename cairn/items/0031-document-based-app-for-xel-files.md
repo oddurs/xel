@@ -3,8 +3,10 @@ id: 31
 uid: 5c65092c-eacb-4f34-9e2b-4ffd0f800b11
 title: Document-based app for .xel files
 type: feature
-status: planned
+status: doing
 milestone: v0.1
+assignee: Oddur Sigurdsson
+claimed: 2026-11-01
 depends_on:
 - 11
 - 28
