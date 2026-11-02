@@ -87,25 +87,7 @@ impl Workbook {
     /// restores the file's last committed state.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = &sqlite_path(path.as_ref())?;
-        let io = |e: std::io::Error| match e.kind() {
-            IoErrorKind::NotFound => Error::NotFound(path.clone()),
-            _ => Error::Io {
-                path: path.clone(),
-                source: e,
-            },
-        };
-        if std::fs::metadata(path).map_err(io)?.is_dir() {
-            return Err(Error::NotAWorkbook(path.clone()));
-        }
-        let probed = Connection::open_with_flags(path, READ_ONLY)
-            .map_err(|e| explain_cannot_open(e, path))
-            .and_then(|probe| identify(&probe, path));
-        let checked = match probed {
-            Ok(version) => Some(version),
-            // A hot journal left by a crash needs a writer to roll it back.
-            Err(Error::Sqlite(e)) if is_hot_journal(&e) => None,
-            Err(e) => return Err(e),
-        };
+        let checked = probe(path)?.map(|(_, version)| version);
 
         let conn = Connection::open_with_flags(path, READ_WRITE)?;
         // SQLite silently falls back to read-only for write-protected files; edits would
@@ -118,6 +100,35 @@ impl Workbook {
             None => identify(&conn, path)?,
         };
         Self::configure(conn, format_version)
+    }
+
+    /// Opens `src` and makes a private working copy of it at `working`, which must not
+    /// exist yet. The returned workbook edits the copy; the macOS document layer leaves the
+    /// user's file untouched until it saves with [`save_copy`](Self::save_copy), so
+    /// autosave, Versions, and iCloud only ever see complete files.
+    ///
+    /// The original is only read, so a WAL left by another tool is not checkpointed into
+    /// it. The exception is a crash journal, which needs a writer to roll it back, as a
+    /// byte-for-byte copy would not; a write-protected original with one is `ReadOnly`.
+    pub fn open_copy(src: impl AsRef<Path>, working: impl AsRef<Path>) -> Result<Self> {
+        let src = &sqlite_path(src.as_ref())?;
+        let working = &sqlite_path(working.as_ref())?;
+        if let Some((original, _)) = probe(src)? {
+            write_copy(&original, working)?;
+        } else {
+            let original = Self::open(src)?;
+            write_copy(&original.conn, working)?;
+            original.close().inspect_err(|_| remove_partial(working))?;
+        }
+        Self::open(working).inspect_err(|_| remove_partial(working))
+    }
+
+    /// Writes a complete, synced copy of this workbook to `dest`, which must not exist yet,
+    /// without the undo trash this session keeps. The document layer writes to a fresh
+    /// temporary file and moves it into place, so a crash part-way leaves the user's file
+    /// as it was.
+    pub fn save_copy(&self, dest: impl AsRef<Path>) -> Result<()> {
+        write_copy(&self.conn, dest.as_ref())
     }
 
     /// The format version recorded in the file when it was opened.
@@ -197,6 +208,96 @@ fn identify(conn: &Connection, path: &Path) -> Result<u32> {
     }
 }
 
+/// Checks `path` on a read-only connection, which never writes to the file. Returns the
+/// connection and format version, or `None` when a crash journal needs a writer to roll
+/// it back first.
+fn probe(path: &Path) -> Result<Option<(Connection, u32)>> {
+    let io = |e: std::io::Error| match e.kind() {
+        IoErrorKind::NotFound => Error::NotFound(path.to_path_buf()),
+        _ => Error::Io {
+            path: path.to_path_buf(),
+            source: e,
+        },
+    };
+    if std::fs::metadata(path).map_err(io)?.is_dir() {
+        return Err(Error::NotAWorkbook(path.to_path_buf()));
+    }
+    let probed = Connection::open_with_flags(path, READ_ONLY)
+        .map_err(|e| explain_cannot_open(e, path))
+        .and_then(|conn| identify(&conn, path).map(|version| (conn, version)));
+    match probed {
+        Ok(found) => Ok(Some(found)),
+        Err(Error::Sqlite(e)) if is_hot_journal(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Writes a compacted copy of `conn`'s database to `dest`, which must not exist yet.
+fn write_copy(conn: &Connection, dest: &Path) -> Result<()> {
+    let dest = &sqlite_path(dest)?;
+    let io = |e: std::io::Error| match e.kind() {
+        IoErrorKind::AlreadyExists => Error::AlreadyExists(dest.clone()),
+        _ => Error::Io {
+            path: dest.clone(),
+            source: e,
+        },
+    };
+    let name = dest.to_str().ok_or_else(|| {
+        io(std::io::Error::new(
+            IoErrorKind::InvalidInput,
+            "SQLite needs a UTF-8 path",
+        ))
+    })?;
+    // SQLite would treat a journal already beside the name as its own and delete it.
+    if sidecar(dest, "-journal").exists() {
+        return Err(Error::AlreadyExists(sidecar(dest, "-journal")));
+    }
+    // Creating the file first claims the name, so a failure below removes only our files.
+    // The bundled SQLite's VACUUM INTO accepts an empty file; older ones refuse it.
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .map_err(io)?;
+    let written = conn
+        .execute("VACUUM INTO ?1", [name])
+        .map_err(Error::from)
+        .and_then(|_| drop_trash(dest))
+        // The copy must be on disk before it replaces the user's file. SQLite's fsync
+        // leaves it in the drive's cache on macOS; sync_all is F_FULLFSYNC.
+        .and_then(|()| file.sync_all().map_err(io));
+    written.inspect_err(|_| remove_partial(dest))
+}
+
+/// Removes a copy this module created and then failed to finish, so it cannot pass for a
+/// finished one.
+fn remove_partial(path: &Path) {
+    // The failure that led here is the error to report; one in removing the leftovers as
+    // well changes nothing the caller can act on. They are files we created, in the
+    // document layer's temporary directory.
+    let _ = std::fs::remove_file(sidecar(path, "-journal"));
+    let _ = std::fs::remove_file(path);
+}
+
+/// Removes undo trash from a fresh copy: trash is a session's undo state, not part of the
+/// document.
+fn drop_trash(copy: &Path) -> Result<()> {
+    let conn = Connection::open_with_flags(copy, READ_WRITE)?;
+    // Zeroing the freed pages keeps deleted data out of the saved file without a second
+    // full copy.
+    conn.pragma_update(None, "secure_delete", true)?;
+    if crate::history::drop_all_trash(&conn)? {
+        let free: i64 = conn.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
+        let pages: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
+        // Compacting copies the file again; only worth it when the trash was a large
+        // part of it, as after deleting a big table.
+        if free * 4 > pages {
+            conn.execute_batch("VACUUM;")?;
+        }
+    }
+    conn.close().map_err(|(_, e)| e.into())
+}
+
 /// SQLite reports an unreadable file only as "unable to open". Asking the OS says why
 /// (permission denied). This runs only after SQLite has failed to open the file, so no
 /// connection in this process holds locks on it: opening and closing another descriptor
@@ -238,9 +339,12 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::test_support::TempDir;
+    use crate::{CellValue, ColumnType};
 
     fn created(dir: &TempDir) -> PathBuf {
         let path = dir.path().join("book.xel");
@@ -585,5 +689,353 @@ mod tests {
             matches!(&err, Error::Io { source, .. } if source.kind() == IoErrorKind::PermissionDenied),
             "permission problem reported as {err}"
         );
+    }
+
+    fn trash_tables(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name GLOB 'xel_trash_*'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn text(s: &str) -> CellValue {
+        CellValue::Text(s.into())
+    }
+
+    #[test]
+    fn a_working_copy_leaves_the_original_untouched_until_saved() {
+        let dir = TempDir::new();
+        let doc = dir.path().join("doc.xel");
+        let mut book = Workbook::create(&doc).unwrap();
+        let t = book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        let a = book.table(t).unwrap().columns[0].id;
+        book.insert_row(t, &[(a, text("one"))]).unwrap();
+        book.close().unwrap();
+        let before = std::fs::read(&doc).unwrap();
+
+        let working = dir.path().join("working.xel");
+        let mut book = Workbook::open_copy(&doc, &working).unwrap();
+        book.insert_row(t, &[(a, text("two"))]).unwrap();
+        assert_eq!(
+            std::fs::read(&doc).unwrap(),
+            before,
+            "edits stay in the copy"
+        );
+
+        let saved = dir.path().join("saved.xel");
+        book.save_copy(&saved).unwrap();
+        std::fs::rename(&saved, &doc).unwrap();
+        book.insert_row(t, &[(a, text("three"))]).unwrap();
+        book.close().unwrap();
+        let reopened = Workbook::open(&doc).unwrap();
+        assert_eq!(reopened.row_count(t).unwrap(), 2, "the save is a snapshot");
+    }
+
+    #[test]
+    fn saved_copies_leave_out_undo_trash_and_the_data_it_held() {
+        let dir = TempDir::new();
+        let mut book = Workbook::create(dir.path().join("doc.xel")).unwrap();
+        let t = book
+            .create_table(
+                "T",
+                &[("a", ColumnType::Text), ("secret", ColumnType::Text)],
+            )
+            .unwrap();
+        let cols = book.table(t).unwrap().columns;
+        let marker = "deleted-secret-marker";
+        book.insert_row(t, &[(cols[0].id, text("kept")), (cols[1].id, text(marker))])
+            .unwrap();
+        // Most of the file is kept data, so the copy is not compacted again and the
+        // zeroing of freed pages is what keeps the secret out.
+        book.conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200)
+                 INSERT INTO \"T\" (\"a\") SELECT hex(randomblob(500)) FROM n;",
+            )
+            .unwrap();
+        book.delete_column(cols[1].id).unwrap();
+
+        let saved = dir.path().join("saved.xel");
+        book.save_copy(&saved).unwrap();
+        assert_eq!(trash_tables(&saved), 0);
+        let free: i64 = Connection::open(&saved)
+            .unwrap()
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap();
+        assert!(free > 0, "this test is meant to cover the uncompacted path");
+        let bytes = std::fs::read(&saved).unwrap();
+        assert!(
+            !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+            "deleted data is not left in the saved file's free pages"
+        );
+
+        book.undo().unwrap();
+        assert_eq!(
+            book.table(t).unwrap().columns.len(),
+            2,
+            "the session's own undo still works after a save"
+        );
+        let copy = Workbook::open(&saved).unwrap();
+        assert_eq!(copy.table(t).unwrap().columns.len(), 1);
+    }
+
+    #[test]
+    fn copies_never_overwrite() {
+        let dir = TempDir::new();
+        let doc = created(&dir);
+        let taken = dir.path().join("taken.xel");
+        std::fs::write(&taken, b"someone else's").unwrap();
+
+        let book = Workbook::open(&doc).unwrap();
+        assert!(matches!(
+            book.save_copy(&taken),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            Workbook::open_copy(&doc, &taken),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert_eq!(std::fs::read(&taken).unwrap(), b"someone else's");
+
+        let free = dir.path().join("free.xel");
+        std::fs::write(sidecar(&free, "-journal"), b"another file's journal").unwrap();
+        assert!(matches!(
+            book.save_copy(&free),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(!free.exists());
+        assert_eq!(
+            std::fs::read(sidecar(&free, "-journal")).unwrap(),
+            b"another file's journal"
+        );
+    }
+
+    #[test]
+    fn open_copy_recovers_a_crashed_original_and_reads_a_locked_one() {
+        let dir = TempDir::new();
+        let path = created(&dir);
+        let writer = Connection::open(&path).unwrap();
+        writer.pragma_update(None, "cache_size", 1).unwrap();
+        writer
+            .execute_batch(
+                "BEGIN; CREATE TABLE big (x);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200)
+                 INSERT INTO big SELECT randomblob(4000) FROM n;",
+            )
+            .unwrap();
+        let crashed = dir.path().join("crashed.xel");
+        std::fs::copy(&path, &crashed).unwrap();
+        std::fs::copy(sidecar(&path, "-journal"), sidecar(&crashed, "-journal")).unwrap();
+        let locked_crash = dir.path().join("locked-crash.xel");
+        std::fs::copy(&path, &locked_crash).unwrap();
+        std::fs::copy(
+            sidecar(&path, "-journal"),
+            sidecar(&locked_crash, "-journal"),
+        )
+        .unwrap();
+        drop(writer);
+
+        let working = dir.path().join("working.xel");
+        Workbook::open_copy(&crashed, &working)
+            .unwrap()
+            .close()
+            .unwrap();
+        let big: i64 = Connection::open(&working)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'big'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(big, 0, "the copy has the last committed state");
+
+        std::fs::set_permissions(&locked_crash, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let fresh = dir.path().join("never-made.xel");
+        assert!(matches!(
+            Workbook::open_copy(&locked_crash, &fresh),
+            Err(Error::ReadOnly(_))
+        ));
+        assert!(!fresh.exists());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut book = Workbook::open_copy(&path, dir.path().join("from-locked.xel")).unwrap();
+        book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn open_copy_never_writes_to_the_original() {
+        let dir = TempDir::new();
+        let path = created(&dir);
+        // Another tool crashed with the file in WAL mode and changes not yet checkpointed:
+        // copy the file and its WAL while that tool still holds them.
+        let other = Connection::open(&path).unwrap();
+        other.pragma_update(None, "journal_mode", "wal").unwrap();
+        other.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        other.execute_batch("CREATE TABLE in_wal (x);").unwrap();
+        let doc = dir.path().join("crashed-wal.xel");
+        std::fs::copy(&path, &doc).unwrap();
+        std::fs::copy(sidecar(&path, "-wal"), sidecar(&doc, "-wal")).unwrap();
+        drop(other);
+        let before = std::fs::read(&doc).unwrap();
+
+        let working = dir.path().join("working.xel");
+        let book = Workbook::open_copy(&doc, &working).unwrap();
+        let copied: i64 = book
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'in_wal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied, 1, "the copy sees the WAL's changes");
+        book.close().unwrap();
+        assert_eq!(
+            std::fs::read(&doc).unwrap(),
+            before,
+            "nothing was checkpointed into it"
+        );
+        assert!(sidecar(&doc, "-wal").exists());
+
+        assert!(matches!(
+            Workbook::open_copy(dir.path().join("missing.xel"), dir.path().join("w2.xel")),
+            Err(Error::NotFound(_))
+        ));
+        assert!(!dir.path().join("w2.xel").exists());
+    }
+
+    const SAVE_LOOP_DIR: &str = "XEL_TEST_SAVE_LOOP_DIR";
+
+    /// The child half of `a_kill_during_save_never_damages_the_document`: edits a working
+    /// copy and saves it over the document the way the app does, until it is killed.
+    #[test]
+    #[ignore = "run by a_kill_during_save_never_damages_the_document"]
+    fn save_until_killed() {
+        let Some(dir) = std::env::var_os(SAVE_LOOP_DIR).map(PathBuf::from) else {
+            return;
+        };
+        let doc = dir.join("doc.xel");
+        let mut book = Workbook::open_copy(&doc, dir.join("working.xel")).unwrap();
+        let table = book.tables().unwrap().remove(0);
+        // Deleted data in the undo trash makes every save take its longest path.
+        let waste = book
+            .create_table("Waste", &[("x", ColumnType::Text)])
+            .unwrap();
+        book.conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+                 INSERT INTO \"Waste\" (\"x\") SELECT hex(randomblob(2000)) FROM n;",
+            )
+            .unwrap();
+        book.delete_table(waste).unwrap();
+        // Saves until the parent kills it; nothing else ends this loop.
+        let mut i = 0_u64;
+        loop {
+            book.insert_row(
+                table.id,
+                &[(table.columns[0].id, text(&format!("save {i}")))],
+            )
+            .unwrap();
+            let saving = dir.join(format!("saving-{i}.xel"));
+            book.save_copy(&saving).unwrap();
+            std::fs::rename(&saving, &doc).unwrap();
+            if i == 0 {
+                // After one completed save, so a slow machine cannot make the kills miss.
+                std::fs::write(dir.join("ready"), b"").unwrap();
+            }
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn a_kill_during_save_never_damages_the_document() {
+        let dir = TempDir::new();
+        let doc = dir.path().join("doc.xel");
+        let mut book = Workbook::create(&doc).unwrap();
+        let t = book
+            .create_table(
+                "T",
+                &[("saved", ColumnType::Text), ("filler", ColumnType::Text)],
+            )
+            .unwrap();
+        // Enough data that a save takes milliseconds, so kills land inside one.
+        book.conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+                 INSERT INTO \"T\" (\"filler\") SELECT hex(randomblob(1000)) FROM n;",
+            )
+            .unwrap();
+        book.close().unwrap();
+        let initial = 1000;
+
+        let exe = std::env::current_exe().unwrap();
+        let ready = dir.path().join("ready");
+        let (mut mid_save, mut last) = (0, initial);
+        for round in 0..20_u64 {
+            let mut child = Command::new(&exe)
+                .args(["--exact", "workbook::tests::save_until_killed", "--ignored"])
+                .env(SAVE_LOOP_DIR, dir.path())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            while !ready.exists() {
+                assert!(child.try_wait().unwrap().is_none(), "the child failed");
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "the child never started"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Spread the kills across the save cycles that follow.
+            std::thread::sleep(Duration::from_millis(5 + round * 7 % 60));
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the child stopped saving"
+            );
+            child.kill().unwrap();
+            child.wait().unwrap();
+
+            let mut partial = false;
+            for entry in std::fs::read_dir(dir.path()).unwrap() {
+                let path = entry.unwrap().path();
+                if path == doc {
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                partial |= name.starts_with("saving-");
+                // Clear the leftovers, as the document layer's temporary directory would be.
+                std::fs::remove_file(&path).unwrap();
+            }
+            mid_save += u32::from(partial);
+
+            let book = Workbook::open(&doc).unwrap();
+            let rows = book.row_count(t).unwrap();
+            assert!(
+                rows >= last,
+                "round {round}: saved rows went from {last} to {rows}"
+            );
+            last = rows;
+            book.close().unwrap();
+            let check: String = Connection::open(&doc)
+                .unwrap()
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(check, "ok", "round {round}");
+            assert_eq!(trash_tables(&doc), 0, "round {round}");
+        }
+        eprintln!(
+            "20 kills: {mid_save} inside a save; {} saves completed",
+            last - initial
+        );
+        assert!(mid_save > 0, "no kill landed inside a save");
+        assert!(last > initial, "no save completed");
     }
 }

@@ -28,3 +28,7 @@ Expose through the chosen bridge: open, create, save, close; list tables and col
 - [ ] Every function has a Swift test, or an engine test if Swift tests cannot run yet
 - [ ] No Rust panic can cross the boundary; a forced panic becomes a Swift error in a test
 - [ ] The engine is called off the main thread; the API is `Sendable`-correct under Swift 6
+
+## 2026-11-01
+
+From 0011: VACUUM INTO (save_copy) fails while a statement is mid-read on the same connection. Do not hold a grid cursor stepping across a save; read windows fully before returning.
