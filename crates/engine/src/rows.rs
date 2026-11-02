@@ -51,13 +51,14 @@ impl Workbook {
     /// Each column's total, in column order: `None` for a column without one. A table
     /// shows a total row when any column has a total.
     pub fn totals(&self, table: TableId) -> Result<Vec<Option<CellValue>>> {
-        let t = self.table(table)?;
+        // Reports a missing table, which the query below would not.
+        crate::schema::table_name(&self.conn, table)?;
         let mut stmt = self.conn.prepare_cached(
             "SELECT total IS NOT NULL, total_value, total_kind FROM xel_columns \
              WHERE table_id = ?1 ORDER BY position, id",
         )?;
         let mut rows = stmt.query([table.0])?;
-        let mut out = Vec::with_capacity(t.columns.len());
+        let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             let has_total: bool = r.get(0)?;
             let dates = r.get_ref(2)?.as_str_or_null().ok().flatten() == Some("date");

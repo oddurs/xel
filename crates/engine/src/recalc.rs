@@ -239,16 +239,22 @@ pub(crate) fn run(
                 .collect(),
         ),
     };
-    for column in &t.columns {
-        let Some(text) = &column.total else { continue };
-        let total = analyze(column, text, &t.name);
-        let stale = retotal.contains(&column.id)
-            || changed
-                .as_ref()
-                .is_none_or(|names| total.reads().any(|n| names.contains(n)));
-        if stale {
-            compute_total(conn, &t, &total, &dates)?;
-        }
+    let stale: Vec<Formula<'_>> = t
+        .columns
+        .iter()
+        .filter_map(|c| c.total.as_ref().map(|text| analyze(c, text, &t.name)))
+        .filter(|total| {
+            retotal.contains(&total.column.id)
+                || changed
+                    .as_ref()
+                    .is_none_or(|names| total.reads().any(|n| names.contains(n)))
+        })
+        .collect();
+    // Each column is read once however many totals use it.
+    let names: BTreeSet<String> = stale.iter().flat_map(|f| f.whole.iter().cloned()).collect();
+    let columns = whole_columns(conn, &t, &names, &dates)?;
+    for total in &stale {
+        compute_total(conn, &t, total, &columns, &dates)?;
     }
     Ok(())
 }
@@ -258,21 +264,33 @@ fn compute_total(
     conn: &Connection,
     t: &Table,
     total: &Formula<'_>,
+    columns: &HashMap<String, Vec<Value>>,
     dates: &HashMap<ColumnId, bool>,
 ) -> Result<()> {
     let value = match &total.expr {
-        Some(expr) => {
-            let columns = whole_columns(conn, t, &total.whole, dates)?;
-            evaluate(
-                expr,
-                &RowContext {
-                    table: &t.name,
-                    row: &HashMap::new(),
-                    columns: &columns,
-                },
-            )
-        }
+        Some(expr) => evaluate(
+            expr,
+            &RowContext {
+                table: &t.name,
+                row: &HashMap::new(),
+                columns,
+            },
+        ),
         None => Value::Error(ErrorKind::Name),
+    };
+    // Excel's total row takes the column's format, so the earliest day of a date column
+    // shows as a day. Values here are typed, so a date column's Min, Max, and Average
+    // totals become dates; a hand-written total keeps what its formula returns.
+    let column = total.column;
+    let date_column = column.ty == ColumnType::Date
+        || (column.ty == ColumnType::Formula
+            && dates
+                .get(&column.id)
+                .copied()
+                .unwrap_or(column.formula_dates));
+    let value = match value {
+        Value::Number(n) if date_column && is_dated_aggregate(column) => Value::Date(n),
+        v => v,
     };
     conn.execute(
         "UPDATE xel_columns SET total_value = ?1, total_kind = ?2 WHERE id = ?3",
@@ -285,22 +303,14 @@ fn compute_total(
     Ok(())
 }
 
-/// Whether `expr` reads a single row (`[@Col]`) anywhere.
-pub(crate) fn reads_this_row(expr: &Expr) -> bool {
-    let mut stack = vec![expr];
-    while let Some(e) = stack.pop() {
-        match e {
-            Expr::Ref(Reference::Structured { this_row: true, .. }) => return true,
-            Expr::Unary { expr, .. } => stack.push(expr),
-            Expr::Binary { left, right, .. } => {
-                stack.push(left);
-                stack.push(right);
-            }
-            Expr::Call { args, .. } => stack.extend(args),
-            _ => {}
-        }
-    }
-    false
+/// Whether a column's total is one of the menu's aggregates that gives a day for a date
+/// column.
+fn is_dated_aggregate(column: &Column) -> bool {
+    column.total.as_ref().is_some_and(|text| {
+        crate::schema::Aggregate::ALL
+            .into_iter()
+            .any(|a| a.keeps_dates() && a.formula(&column.name) == *text)
+    })
 }
 
 /// The values of the named columns of `t`, by lower-cased name, in row order.
@@ -395,7 +405,7 @@ fn analyze<'t>(column: &'t Column, text: &str, table: &str) -> Formula<'t> {
 
 /// Whether `expr` can give a different result in different rows: it reads this row, a
 /// name, or calls a volatile function.
-fn varies_by_row(expr: &Expr) -> bool {
+pub(crate) fn varies_by_row(expr: &Expr) -> bool {
     let mut stack = vec![expr];
     while let Some(e) = stack.pop() {
         match e {
@@ -1158,11 +1168,15 @@ mod tests {
 
         assert!(matches!(
             o.book.set_total(o.qty, Some("=[@Qty]")),
-            Err(Error::TotalReadsRow(_))
+            Err(Error::NotATotal(_))
         ));
         assert!(matches!(
             o.book.set_total(o.qty, Some("=SUM([Qty]")),
             Err(Error::Formula { .. })
+        ));
+        assert!(matches!(
+            o.book.set_total(o.qty, Some("=SUM([Qty])*Rate")),
+            Err(Error::NotATotal(_))
         ));
         assert_eq!(
             totals(&o.book, o.t)[0],
@@ -1213,6 +1227,20 @@ mod tests {
         let want: Vec<Option<CellValue>> = aggregates.iter().map(|(_, n)| Some(num(*n))).collect();
         assert_eq!(totals(&book, t), want);
 
+        // Count counts what is filled in, as Excel's total row does, not only numbers.
+        let words = book
+            .create_table("Words", &[("Word", ColumnType::Text)])
+            .unwrap();
+        let word = book.table(words).unwrap().columns[0].id;
+        for w in ["a", "b"] {
+            book.insert_row(words, &[(word, CellValue::Text(w.into()))])
+                .unwrap();
+        }
+        book.insert_row(words, &[]).unwrap();
+        book.set_total(word, Some(&Aggregate::Count.formula("Word")))
+            .unwrap();
+        assert_eq!(totals(&book, words), [Some(num(2.0))]);
+
         let d = book
             .create_table("Dates", &[("When", ColumnType::Date)])
             .unwrap();
@@ -1235,5 +1263,8 @@ mod tests {
             totals(&book, d),
             [Some(CellValue::Date(Date::new(2026, 11, 3).unwrap()))]
         );
+        // A hand-written total keeps what its formula returns; formulas follow Excel.
+        book.set_total(when, Some("=MIN([When])+0")).unwrap();
+        assert_eq!(totals(&book, d), [Some(num(46329.0))]);
     }
 }

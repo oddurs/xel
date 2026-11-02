@@ -592,14 +592,15 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A total must parse and must not read a single row: there is no row in a total row.
+/// A total must parse and give one value for the whole table: no single row, no name, no
+/// volatile function, as a total is recomputed only when a column it reads changes.
 fn check_total(column: &str, formula: &str) -> Result<()> {
     let expr = crate::formula::parse(formula).map_err(|error| Error::Formula {
         column: column.into(),
         error,
     })?;
-    if crate::recalc::reads_this_row(&expr) {
-        return Err(Error::TotalReadsRow(column.into()));
+    if crate::recalc::varies_by_row(&expr) {
+        return Err(Error::NotATotal(column.into()));
     }
     Ok(())
 }
@@ -615,13 +616,22 @@ pub enum Aggregate {
 }
 
 impl Aggregate {
+    pub(crate) const ALL: [Self; 5] = [Self::Sum, Self::Average, Self::Count, Self::Min, Self::Max];
+
+    /// Whether this total of a date column is itself a date: the earliest, latest, or
+    /// average day, but not a sum or a count.
+    pub(crate) fn keeps_dates(self) -> bool {
+        matches!(self, Self::Min | Self::Max | Self::Average)
+    }
+
     /// The total formula for `column`: `=SUM([Amount])`.
     #[must_use]
     pub fn formula(self, column: &str) -> String {
         let function = match self {
             Self::Sum => "SUM",
             Self::Average => "AVERAGE",
-            Self::Count => "COUNT",
+            // Excel's total row counts what is filled in (SUBTOTAL 103), not only numbers.
+            Self::Count => "COUNTA",
             Self::Min => "MIN",
             Self::Max => "MAX",
         };

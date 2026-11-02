@@ -76,7 +76,7 @@ impl From<xel_engine::Error> for XelError {
             | E::NeedsFormula(_)
             | E::FormulaColumn(_)
             | E::NotAFormulaColumn(_)
-            | E::TotalReadsRow(_) => Self::Invalid { message },
+            | E::NotATotal(_) => Self::Invalid { message },
             _ => Self::Other { message },
         }
     }

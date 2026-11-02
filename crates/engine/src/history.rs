@@ -687,7 +687,8 @@ mod tests {
         );
         dump(
             conn,
-            "SELECT id, table_id, name, type, position, formula, formula_kind FROM xel_columns ORDER BY id",
+            "SELECT id, table_id, name, type, position, formula, formula_kind, total, total_value, \
+             total_kind FROM xel_columns ORDER BY id",
             &mut out,
         );
         dump(
@@ -1051,6 +1052,20 @@ mod tests {
                     &[("a", TYPES[rng.below(5)]), ("b", TYPES[rng.below(5)])],
                 )
                 .map(|_| ()),
+            (1, Some(t)) if rng.below(2) == 0 => {
+                let cols = book.table(t).unwrap().columns;
+                let c = &cols[rng.below(cols.len())];
+                match rng.pick(&[
+                    crate::schema::Aggregate::Sum,
+                    crate::schema::Aggregate::Count,
+                    crate::schema::Aggregate::Min,
+                ]) {
+                    Some(kind) if rng.below(4) > 0 => {
+                        book.set_total(c.id, Some(&kind.formula(&c.name)))
+                    }
+                    _ => book.set_total(c.id, None),
+                }
+            }
             (1, Some(t)) => book.rename_table(t, &format!("R{n}")),
             (2, Some(t)) if rng.below(3) == 0 => book.delete_table(t),
             (3, Some(t)) => book

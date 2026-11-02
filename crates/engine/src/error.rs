@@ -71,9 +71,9 @@ pub enum Error {
     #[error("column {0:?} is computed by a formula and cannot be edited")]
     FormulaColumn(String),
     #[error(
-        "the total of column {0:?} reads a single row; a total reads whole columns, such as [Amount]"
+        "the total of column {0:?} must read whole columns, such as [Amount], not a single row, a name, or a volatile function"
     )]
-    TotalReadsRow(String),
+    NotATotal(String),
     #[error("column {} is not a formula column", .0.raw())]
     NotAFormulaColumn(ColumnId),
     #[error("database error: {0}")]
