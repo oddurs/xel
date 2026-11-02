@@ -6,34 +6,45 @@ import XelEngine
 @Observable
 final class DocumentModel {
     private(set) var tables: [TableInfo] = []
+    /// The table shown in the grid.
+    var selection: Int64?
+    /// The selected table's rows, or nil while there is none.
+    var grid: GridData?
 
+    /// Takes the workbook's tables, keeping the selection when its table is still there.
     func set(_ tables: [TableInfo]) {
         self.tables = tables
+        if !tables.contains(where: { $0.id == selection }) {
+            selection = tables.first?.id
+        }
     }
 }
 
-/// The document window's content until the sidebar (0032) and grid (0033) arrive: the
-/// workbook's tables, and a way to add one.
+/// A document window: the workbook's tables beside the selected table's grid.
 struct DocumentView: View {
     let model: DocumentModel
     let addTable: () -> Void
+    let select: (Int64?) -> Void
 
     var body: some View {
-        Group {
-            if model.tables.isEmpty {
+        NavigationSplitView {
+            List(
+                model.tables, id: \.id,
+                selection: Binding(get: { model.selection }, set: { select($0) })
+            ) { table in
+                Label(table.name, systemImage: "tablecells")
+            }
+            .navigationSplitViewColumnWidth(min: 160, ideal: 200)
+        } detail: {
+            if let grid = model.grid {
+                GridRepresentable(data: grid)
+            } else {
                 ContentUnavailableView {
                     Label("No Tables", systemImage: "tablecells")
                 } description: {
                     Text("A workbook holds typed tables.")
                 } actions: {
                     Button("New Table", action: addTable)
-                }
-            } else {
-                List(model.tables, id: \.id) { table in
-                    LabeledContent(table.name) {
-                        Text("^[\(table.columns.count) column](inflect: true)")
-                            .foregroundStyle(.secondary)
-                    }
                 }
             }
         }

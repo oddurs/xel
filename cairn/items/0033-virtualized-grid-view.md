@@ -3,8 +3,10 @@ id: 33
 uid: 2aa51a9f-65eb-431c-8d44-5c6b87e49daf
 title: Virtualized grid view
 type: feature
-status: planned
+status: doing
 milestone: v0.1
+assignee: Oddur Sigurdsson
+claimed: 2026-11-01
 depends_on:
 - 8
 - 28

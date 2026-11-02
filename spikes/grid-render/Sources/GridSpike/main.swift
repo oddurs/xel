@@ -1,8 +1,11 @@
 import AppKit
 import QuartzCore
+import XelEngine
+import XelKit
+import XelUI
 
 // Scrolls a synthetic 1,000,000 × 50 table in one of two renderers and times every frame
-// with a display link: `swift run -c release GridSpike <table|cells|custom|lean|ct|async|canvas|empty> <steady|jump>`.
+// with a display link: `swift run -c release GridSpike <table|cells|custom|lean|ct|async|canvas|empty|xel> <steady|jump>`.
 // Prints one JSON line of frame statistics and memory.
 
 let rowCount = 1_000_000
@@ -317,14 +320,41 @@ final class Driver: NSObject {
 
 let args = CommandLine.arguments
 guard args.count == 3,
-    ["table", "cells", "custom", "lean", "ct", "async", "canvas", "empty"].contains(args[1]),
+    args[1] != "xel" || ProcessInfo.processInfo.environment["XEL_BENCH_FILE"] != nil,
+    ["table", "cells", "custom", "lean", "ct", "async", "canvas", "empty", "xel"].contains(args[1]),
     ["steady", "jump"].contains(args[2])
 else {
     FileHandle.standardError.write(
         Data(
-            "usage: GridSpike <table|cells|custom|lean|ct|async|canvas|empty> <steady|jump>\n".utf8)
+            "usage: GridSpike <table|cells|custom|lean|ct|async|canvas|empty|xel> <steady|jump>\n"
+                .utf8)
     )
     exit(2)
+}
+
+/// The grid's data for mode `xel`, opened before the window is made.
+nonisolated(unsafe) var benchData: GridData?
+/// Mode `xel` shows this container, whose scroll view the driver scrolls.
+nonisolated(unsafe) var benchContainer: NSView?
+
+if args[1] == "xel", let file = ProcessInfo.processInfo.environment["XEL_BENCH_FILE"] {
+    let opened = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var result: (Workbook, TableInfo, UInt64)?
+    Task.detached {
+        let book = try await Workbook.open(URL(filePath: file))
+        let table = try await book.tables()[0]
+        result = (book, table, try await book.rowCount(of: table.id))
+        opened.signal()
+    }
+    opened.wait()
+    MainActor.assumeIsolated {
+        guard let (book, table, count) = result else { exit(1) }
+        benchData = GridData(table: table.id, columns: table.columns, rowCount: Int(count)) {
+            offset, limit, stillWanted in
+            guard stillWanted() else { throw CancellationError() }
+            return try await book.rows(of: table.id, offset: offset, limit: limit)
+        }
+    }
 }
 
 MainActor.assumeIsolated {
@@ -339,6 +369,13 @@ MainActor.assumeIsolated {
         case "ct":
             useCoreText = true
             return makeCustom()
+        case "xel":
+            // The app's grid over a real workbook: XEL_BENCH_FILE names a .xel file, and its
+            // first table is shown.
+            // The whole grid, header and row numbers included: they redraw on every scroll too.
+            let container = makeGridView(data: benchData)
+            benchContainer = container
+            return container.scrollView
         case "empty":
             let scroll = NSScrollView()
             scroll.documentView = Blank(
@@ -365,7 +402,7 @@ MainActor.assumeIsolated {
         contentRect: NSRect(x: 0, y: 0, width: width, height: height), styleMask: [.titled],
         backing: .buffered, defer: false)
     window.title = "Grid spike: \(args[1]) \(args[2])"
-    window.contentView = scroll
+    window.contentView = benchContainer ?? scroll
     window.makeKeyAndOrderFront(nil)
     app.activate()
     let driver = Driver(scroll: scroll, jump: args[2] == "jump", label: "\(args[1])-\(args[2])")

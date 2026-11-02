@@ -10,6 +10,12 @@ let engineLibraries =
 let package = Package(
     name: "Xel",
     platforms: [.macOS(.v26)],
+    products: [
+        .executable(name: "Xel", targets: ["Xel"]),
+        // For spikes/grid-render, which measures the real grid the way spike 0008 did.
+        .library(name: "XelUI", targets: ["XelUI"]),
+        .library(name: "XelKit", targets: ["XelKit"]),
+    ],
     targets: [
         .systemLibrary(name: "xel_ffiFFI", path: "Generated/xel_ffiFFI"),
         .target(
