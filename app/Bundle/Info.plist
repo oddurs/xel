@@ -33,8 +33,9 @@
 			<string>Xel Workbook</string>
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
+			<!-- None until the app can open documents (0031); then Owner. -->
 			<key>LSHandlerRank</key>
-			<string>Owner</string>
+			<string>None</string>
 			<key>LSItemContentTypes</key>
 			<array>
 				<string>io.github.oddurs.xel.workbook</string>
