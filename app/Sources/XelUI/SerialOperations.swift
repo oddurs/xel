@@ -17,21 +17,25 @@ final class SerialOperations: Sendable {
         }
     }
 
-    /// Submits `operation` and returns at once.
-    func submit(_ operation: @escaping Operation) {
-        continuation.yield(operation)
+    /// Submits `operation` and returns at once. Returns false, running nothing, once the
+    /// queue has finished.
+    @discardableResult
+    func submit(_ operation: @escaping Operation) -> Bool {
+        if case .terminated = continuation.yield(operation) { return false }
+        return true
     }
 
     /// Submits `operation` and waits for its result.
     func run<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { result in
-            submit {
+            let queued = submit {
                 do {
                     result.resume(returning: try await operation())
                 } catch {
                     result.resume(throwing: error)
                 }
             }
+            if !queued { result.resume(throwing: CancellationError()) }
         }
     }
 
@@ -42,7 +46,7 @@ final class SerialOperations: Sendable {
     {
         let done = DispatchSemaphore(value: 0)
         let outcome = Mutex<Result<T, any Error>?>(nil)
-        submit {
+        let queued = submit {
             let result: Result<T, any Error>
             do {
                 result = .success(try await operation())
@@ -52,6 +56,7 @@ final class SerialOperations: Sendable {
             outcome.withLock { $0 = result }
             done.signal()
         }
+        guard queued else { throw CancellationError() }
         done.wait()
         // The operation stored an outcome before signalling.
         return try outcome.withLock { $0! }.get()

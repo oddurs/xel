@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import SwiftUI
 import XelEngine
 import XelKit
@@ -9,6 +10,9 @@ import XelKit
 /// place. Autosave, Versions, Revert, and iCloud only ever see whole files.
 @objc(XelDocument)
 public final class XelDocument: NSDocument {
+    private nonisolated static let log = Logger(
+        subsystem: "io.github.oddurs.xel", category: "document")
+
     /// What the window shows.
     let model = DocumentModel()
 
@@ -16,6 +20,8 @@ public final class XelDocument: NSDocument {
     private var workbook: Workbook?
     private var workingDirectory: URL?
     private var watcher: Task<Void, Never>?
+    /// Counts workbooks opened, so a load from a replaced one is never shown.
+    private var generation = 0
 
     override public class var autosavesInPlace: Bool { true }
 
@@ -58,6 +64,8 @@ public final class XelDocument: NSDocument {
                 try await open(directory.appending(path: "working.xel"))
             }
         } catch {
+            // The opening error is the one to report; the directory is empty or holds a
+            // partial copy that `open` already removed.
             try? FileManager.default.removeItem(at: directory)
             throw error
         }
@@ -73,21 +81,54 @@ public final class XelDocument: NSDocument {
     /// working copy.
     private func retire(_ workbook: Workbook?, directory: URL?) {
         guard let workbook, let directory else { return }
-        operations.submit {
-            try? await workbook.close()
-            try? FileManager.default.removeItem(at: directory)
+        operations.submit { await Self.discard(workbook, directory: directory) }
+    }
+
+    /// Closes a workbook nobody uses any more and removes its working copy. Nothing can be
+    /// done about a failure here but report it: the user's file is not involved. Not on the
+    /// main actor: `close` blocks the main thread while this runs.
+    private nonisolated static func discard(_ workbook: Workbook, directory: URL) async {
+        do {
+            try await workbook.close()
+        } catch {
+            log.error("closing a working copy failed: \(error, privacy: .public)")
+        }
+        do {
+            try FileManager.default.removeItem(at: directory)
+        } catch {
+            log.error("removing a working copy failed: \(error, privacy: .public)")
         }
     }
 
     /// Keeps the model in step with the workbook.
     private func watch(_ workbook: Workbook) {
         watcher?.cancel()
-        let model = model
-        watcher = Task { [operations] in
-            await model.load(from: workbook, operations: operations)
-            for await _ in await workbook.changes() {
-                await model.load(from: workbook, operations: operations)
+        generation += 1
+        let current = generation
+        watcher = Task { [weak self] in
+            // Subscribed before the first load, so no change falls between the two.
+            let changes = await workbook.changes()
+            await self?.load(from: workbook, generation: current)
+            for await change in changes {
+                // Row edits leave the list of tables and columns as it was.
+                if case .rows = change { continue }
+                await self?.load(from: workbook, generation: current)
             }
+        }
+    }
+
+    /// Reloads the model from `workbook`, in turn with the document's edits, unless the
+    /// document has moved on to another workbook meanwhile.
+    private nonisolated func load(from workbook: Workbook, generation: Int) async {
+        do {
+            let tables = try await operations.run { try await workbook.tables() }
+            await MainActor.run {
+                if self.generation == generation { self.model.set(tables) }
+            }
+        } catch is CancellationError {
+            // The document closed.
+        } catch {
+            await MainActor.run { report(error) }
         }
     }
 
@@ -98,11 +139,13 @@ public final class XelDocument: NSDocument {
         let directory = workingDirectory
         self.workbook = nil
         workingDirectory = nil
-        // Blocks so the working copy is gone before the app can quit.
+        // Blocks so the working copy is gone before the app can quit. Nothing queued waits
+        // for the main thread (see `edit`), so this cannot deadlock.
         if let workbook, let directory {
-            try? operations.runBlocking {
-                try? await workbook.close()
-                try? FileManager.default.removeItem(at: directory)
+            do {
+                try operations.runBlocking { await Self.discard(workbook, directory: directory) }
+            } catch {
+                Self.log.error("closing a document twice: \(error, privacy: .public)")
             }
         }
         operations.finish()
@@ -112,18 +155,21 @@ public final class XelDocument: NSDocument {
 
     override public func presentedItemDidChange() {
         super.presentedItemDidChange()
+        // NSDocument does not reload by itself: without this, the window kept showing the
+        // old contents after the file was replaced.
         Task { @MainActor in self.reloadIfChangedOutside() }
     }
 
     /// Reloads the file when something else replaced it, such as iCloud or another app,
     /// and there are no unsaved changes to lose. With unsaved changes NSDocument's own
-    /// check refuses to save over the newer file and asks the user.
+    /// check refuses to save over the newer file and asks the user. Any change of date
+    /// counts: a synced or restored file can carry an older one.
     func reloadIfChangedOutside() {
         guard let url = fileURL, let type = fileType, !isDocumentEdited,
             let known = fileModificationDate,
             let now = try? url.resourceValues(forKeys: [.contentModificationDateKey])
                 .contentModificationDate,
-            now > known
+            now != known
         else { return }
         do {
             try revert(toContentsOf: url, ofType: type)
@@ -137,21 +183,41 @@ public final class XelDocument: NSDocument {
     /// Runs an edit on the workbook in order and makes it undoable. The engine keeps the
     /// history; the undo manager only mirrors it, so the Edit menu and the document's
     /// edited state follow.
+    ///
+    /// The undo is registered now, not when the edit finishes: the document must count as
+    /// edited before a quick close or quit, and nothing queued may wait for the main
+    /// thread, which `read`, `write`, and `close` block while they wait for the queue.
     func edit(_ name: String, _ change: @escaping @Sendable (Workbook) async throws -> Void) {
         guard let workbook else { return }
+        undoManager?.registerUndo(withTarget: self) { $0.step(undo: true, name) }
+        undoManager?.setActionName(name)
         operations.submit { [weak self] in
             do {
                 try await change(workbook)
-                await MainActor.run { self?.recordUndo(name) }
             } catch {
-                await MainActor.run { _ = self?.presentError(error) }
+                self?.failed(error)
             }
         }
     }
 
-    private func recordUndo(_ name: String) {
-        undoManager?.registerUndo(withTarget: self) { $0.step(undo: true, name) }
-        undoManager?.setActionName(name)
+    /// An edit, undo, or redo the engine refused, or could not replay. The mirrored
+    /// history no longer matches the engine's, so it is cleared. Reported without waiting,
+    /// from any thread.
+    private nonisolated func failed(_ error: (any Error)?) {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                self.undoManager?.removeAllActions()
+                if let error { self.report(error) }
+            }
+        }
+    }
+
+    private func report(_ error: any Error) {
+        if let window = windowControllers.first?.window {
+            presentError(error, modalFor: window, delegate: nil, didPresent: nil, contextInfo: nil)
+        } else {
+            presentError(error)
+        }
     }
 
     /// One engine undo or redo, registering its opposite as the undo manager expects.
@@ -161,14 +227,11 @@ public final class XelDocument: NSDocument {
         guard let workbook else { return }
         operations.submit { [weak self] in
             do {
-                _ = try await undo ? workbook.undo() : workbook.redo()
+                let moved = try await undo ? workbook.undo() : workbook.redo()
+                // The engine had nothing to replay: the two histories have parted.
+                if !moved { self?.failed(nil) }
             } catch {
-                // The engine dropped a step the file no longer allows; the mirrored
-                // history no longer matches it.
-                await MainActor.run {
-                    self?.undoManager?.removeAllActions()
-                    _ = self?.presentError(error)
-                }
+                self?.failed(error)
             }
         }
     }
@@ -206,10 +269,14 @@ public final class XelDocument: NSDocument {
     var workingCopyDirectory: URL? { workingDirectory }
 
     /// Waits until everything submitted so far has reached the engine, and the model has
-    /// caught up with it.
+    /// caught up with it through the change stream.
     func settle() async throws {
         guard let workbook else { return }
         let tables = try await operations.run { try await workbook.tables() }
-        model.set(tables)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while model.tables != tables {
+            guard ContinuousClock.now < deadline else { throw CancellationError() }
+            try await Task.sleep(for: .milliseconds(5))
+        }
     }
 }

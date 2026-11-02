@@ -1,6 +1,5 @@
 import SwiftUI
 import XelEngine
-import XelKit
 
 /// What a document window shows, kept current from the workbook.
 @MainActor
@@ -10,14 +9,6 @@ final class DocumentModel {
 
     func set(_ tables: [TableInfo]) {
         self.tables = tables
-    }
-
-    /// Reloads from `workbook`, in turn with the document's edits.
-    nonisolated func load(from workbook: Workbook, operations: SerialOperations) async {
-        guard let tables = try? await operations.run({ try await workbook.tables() }) else {
-            return
-        }
-        await set(tables)
     }
 }
 

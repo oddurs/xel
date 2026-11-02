@@ -127,4 +127,31 @@ func exists(_ url: URL) -> Bool {
         )
         document.close()
     }
+
+    // Each of these waited forever when queued edits needed the main thread, which save,
+    // undo, and close block.
+    @Test func savingUndoingAndClosingRightAfterAnEditKeepTheirOrder() async throws {
+        let scratch = try Scratch()
+        let url = scratch.file("people.xel")
+        try await makeFile(url, table: "People")
+        let document = try XelDocument(contentsOf: url, ofType: workbookType)
+        let undo = try #require(document.undoManager)
+
+        document.addTable()
+        try document.writeSafely(to: url, ofType: workbookType, for: .saveOperation)
+        let saved = try await Workbook.open(url)
+        #expect(try await saved.tables().map(\.name) == ["People", "Table 1"])
+        try await saved.close()
+
+        document.addTable()
+        undo.undo()
+        try await document.settle()
+        #expect(document.model.tables.map(\.name) == ["People", "Table 1"])
+        #expect(undo.canRedo, "the undo manager and the engine agree on what was undone")
+
+        let working = try #require(document.workingCopyDirectory)
+        document.addTable()
+        document.close()
+        #expect(!exists(working))
+    }
 }
