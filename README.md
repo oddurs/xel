@@ -31,7 +31,7 @@ git clone https://github.com/oddurs/xel
 cd xel
 scripts/setup
 scripts/task build
-swift run --package-path app
+open build/Xel.app
 ```
 
 ## Development

@@ -100,6 +100,39 @@ build() {
     if universal; then
         lipo "$bin" -verify_arch arm64 x86_64
     fi
+    bundle "$bin"
+}
+
+# Assembles build/Xel.app around the app binary at $1: macOS treats a bare executable as
+# a background tool, and only a bundle can declare the .xel document type. Signed ad hoc
+# so it runs locally; Developer ID signing and notarization are the release's job. An
+# unchanged binary and plist leave the bundle, and its signature, alone.
+bundle() {
+    app=build/Xel.app
+    plist=$(mktemp "${TMPDIR:-/tmp}/xel-plist.XXXXXX")
+    cp app/Bundle/Info.plist "$plist"
+    version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/ffi/Cargo.toml | head -n 1)
+    plutil -replace CFBundleShortVersionString -string "$version" "$plist"
+    plutil -replace CFBundleVersion -string "$(git rev-list --count HEAD)" "$plist"
+    plutil -lint -s "$plist"
+    # Signing rewrites the binary inside the bundle, so compare the unsigned inputs
+    # against the last ones bundled, kept beside the bundle.
+    inputs=build/.bundle-inputs
+    mkdir -p "$app/Contents/MacOS" "$inputs"
+    if ! cmp -s "$1" "$inputs/Xel" || ! cmp -s "$plist" "$inputs/Info.plist"; then
+        cp "$1" "$inputs/Xel"
+        cp "$plist" "$inputs/Info.plist"
+        cp "$1" "$app/Contents/MacOS/Xel"
+        cp "$plist" "$app/Contents/Info.plist"
+        codesign --force --sign - "$app"
+    fi
+    rm -f "$plist"
+    executable=$(plutil -extract CFBundleExecutable raw "$app/Contents/Info.plist")
+    if [ ! -x "$app/Contents/MacOS/$executable" ]; then
+        echo "task: Info.plist names $executable, which is not in the bundle" >&2
+        exit 1
+    fi
+    codesign --verify --strict "$app"
 }
 
 swift_fmt_check() {
