@@ -23,7 +23,11 @@ let package = Package(
         ),
         // The app's interface to the engine: runs it off the main thread and reports changes.
         .target(name: "XelKit", dependencies: ["XelEngine"]),
-        .executableTarget(name: "Xel", dependencies: ["XelKit"]),
+        // Documents, windows, and menus: the AppKit side of the app, kept out of the
+        // executable so tests can reach it.
+        .target(name: "XelUI", dependencies: ["XelKit", "XelEngine"]),
+        .executableTarget(name: "Xel", dependencies: ["XelUI"]),
         .testTarget(name: "XelKitTests", dependencies: ["XelKit", "XelEngine"]),
+        .testTarget(name: "XelUITests", dependencies: ["XelUI", "XelKit", "XelEngine"]),
     ]
 )
