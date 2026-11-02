@@ -87,25 +87,7 @@ impl Workbook {
     /// restores the file's last committed state.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = &sqlite_path(path.as_ref())?;
-        let io = |e: std::io::Error| match e.kind() {
-            IoErrorKind::NotFound => Error::NotFound(path.clone()),
-            _ => Error::Io {
-                path: path.clone(),
-                source: e,
-            },
-        };
-        if std::fs::metadata(path).map_err(io)?.is_dir() {
-            return Err(Error::NotAWorkbook(path.clone()));
-        }
-        let probed = Connection::open_with_flags(path, READ_ONLY)
-            .map_err(|e| explain_cannot_open(e, path))
-            .and_then(|probe| identify(&probe, path));
-        let checked = match probed {
-            Ok(version) => Some(version),
-            // A hot journal left by a crash needs a writer to roll it back.
-            Err(Error::Sqlite(e)) if is_hot_journal(&e) => None,
-            Err(e) => return Err(e),
-        };
+        let checked = probe(path)?.map(|(_, version)| version);
 
         let conn = Connection::open_with_flags(path, READ_WRITE)?;
         // SQLite silently falls back to read-only for write-protected files; edits would
@@ -125,22 +107,20 @@ impl Workbook {
     /// user's file untouched until it saves with [`save_copy`](Self::save_copy), so
     /// autosave, Versions, and iCloud only ever see complete files.
     ///
-    /// A crash journal beside the original is rolled back first, which a byte-for-byte
-    /// copy would not do. A write-protected original (a locked document) is only read.
+    /// The original is only read, so a WAL left by another tool is not checkpointed into
+    /// it. The exception is a crash journal, which needs a writer to roll it back, as a
+    /// byte-for-byte copy would not; a write-protected original with one is `ReadOnly`.
     pub fn open_copy(src: impl AsRef<Path>, working: impl AsRef<Path>) -> Result<Self> {
-        match Self::open(src.as_ref()) {
-            Ok(original) => {
-                write_copy(&original.conn, working.as_ref())?;
-                original.close()?;
-            }
-            Err(Error::ReadOnly(src)) => {
-                let original = Connection::open_with_flags(&src, READ_ONLY)?;
-                identify(&original, &src)?;
-                write_copy(&original, working.as_ref())?;
-            }
-            Err(e) => return Err(e),
+        let src = &sqlite_path(src.as_ref())?;
+        let working = &sqlite_path(working.as_ref())?;
+        if let Some((original, _)) = probe(src)? {
+            write_copy(&original, working)?;
+        } else {
+            let original = Self::open(src)?;
+            write_copy(&original.conn, working)?;
+            original.close().inspect_err(|_| remove_partial(working))?;
         }
-        Self::open(working)
+        Self::open(working).inspect_err(|_| remove_partial(working))
     }
 
     /// Writes a complete, synced copy of this workbook to `dest`, which must not exist yet,
@@ -228,10 +208,30 @@ fn identify(conn: &Connection, path: &Path) -> Result<u32> {
     }
 }
 
-/// SQLite reports an unreadable file only as "unable to open". Asking the OS says why
-/// (permission denied). This runs only after SQLite has failed to open the file, so no
-/// connection in this process holds locks on it: opening and closing another descriptor
-/// would otherwise release them, as POSIX locks are per process.
+/// Checks `path` on a read-only connection, which never writes to the file. Returns the
+/// connection and format version, or `None` when a crash journal needs a writer to roll
+/// it back first.
+fn probe(path: &Path) -> Result<Option<(Connection, u32)>> {
+    let io = |e: std::io::Error| match e.kind() {
+        IoErrorKind::NotFound => Error::NotFound(path.to_path_buf()),
+        _ => Error::Io {
+            path: path.to_path_buf(),
+            source: e,
+        },
+    };
+    if std::fs::metadata(path).map_err(io)?.is_dir() {
+        return Err(Error::NotAWorkbook(path.to_path_buf()));
+    }
+    let probed = Connection::open_with_flags(path, READ_ONLY)
+        .map_err(|e| explain_cannot_open(e, path))
+        .and_then(|conn| identify(&conn, path).map(|version| (conn, version)));
+    match probed {
+        Ok(found) => Ok(Some(found)),
+        Err(Error::Sqlite(e)) if is_hot_journal(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Writes a compacted copy of `conn`'s database to `dest`, which must not exist yet.
 fn write_copy(conn: &Connection, dest: &Path) -> Result<()> {
     let dest = &sqlite_path(dest)?;
@@ -248,8 +248,12 @@ fn write_copy(conn: &Connection, dest: &Path) -> Result<()> {
             "SQLite needs a UTF-8 path",
         ))
     })?;
-    // Creating the file first claims the name, so a failure below removes only our file.
-    // VACUUM INTO accepts an empty file.
+    // SQLite would treat a journal already beside the name as its own and delete it.
+    if sidecar(dest, "-journal").exists() {
+        return Err(Error::AlreadyExists(sidecar(dest, "-journal")));
+    }
+    // Creating the file first claims the name, so a failure below removes only our files.
+    // The bundled SQLite's VACUUM INTO accepts an empty file; older ones refuse it.
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -259,28 +263,45 @@ fn write_copy(conn: &Connection, dest: &Path) -> Result<()> {
         .execute("VACUUM INTO ?1", [name])
         .map_err(Error::from)
         .and_then(|_| drop_trash(dest))
-        // VACUUM INTO does not sync; the copy must be on disk before it replaces the
-        // user's file. On macOS this is F_FULLFSYNC.
+        // The copy must be on disk before it replaces the user's file. SQLite's fsync
+        // leaves it in the drive's cache on macOS; sync_all is F_FULLFSYNC.
         .and_then(|()| file.sync_all().map_err(io));
-    if written.is_err() {
-        // A partial copy must not look like a finished one. The copy's error is the one
-        // worth reporting; failing to remove the partial file as well changes nothing the
-        // caller can act on.
-        let _ = std::fs::remove_file(dest);
-    }
-    written
+    written.inspect_err(|_| remove_partial(dest))
 }
 
-/// Removes undo trash from a fresh copy. Trash is a session's undo state, not part of the
-/// document, and the copy is vacuumed again so deleted data does not linger in free pages.
+/// Removes a copy this module created and then failed to finish, so it cannot pass for a
+/// finished one.
+fn remove_partial(path: &Path) {
+    // The failure that led here is the error to report; one in removing the leftovers as
+    // well changes nothing the caller can act on. They are files we created, in the
+    // document layer's temporary directory.
+    let _ = std::fs::remove_file(sidecar(path, "-journal"));
+    let _ = std::fs::remove_file(path);
+}
+
+/// Removes undo trash from a fresh copy: trash is a session's undo state, not part of the
+/// document.
 fn drop_trash(copy: &Path) -> Result<()> {
     let conn = Connection::open_with_flags(copy, READ_WRITE)?;
+    // Zeroing the freed pages keeps deleted data out of the saved file without a second
+    // full copy.
+    conn.pragma_update(None, "secure_delete", true)?;
     if crate::history::drop_all_trash(&conn)? {
-        conn.execute_batch("VACUUM;")?;
+        let free: i64 = conn.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
+        let pages: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
+        // Compacting copies the file again; only worth it when the trash was a large
+        // part of it, as after deleting a big table.
+        if free * 4 > pages {
+            conn.execute_batch("VACUUM;")?;
+        }
     }
     conn.close().map_err(|(_, e)| e.into())
 }
 
+/// SQLite reports an unreadable file only as "unable to open". Asking the OS says why
+/// (permission denied). This runs only after SQLite has failed to open the file, so no
+/// connection in this process holds locks on it: opening and closing another descriptor
+/// would otherwise release them, as POSIX locks are per process.
 fn explain_cannot_open(e: rusqlite::Error, path: &Path) -> Error {
     if matches!(e.sqlite_error_code(), Some(ErrorCode::CannotOpen))
         && let Err(io) = std::fs::File::open(path)
@@ -728,11 +749,24 @@ mod tests {
         let marker = "deleted-secret-marker";
         book.insert_row(t, &[(cols[0].id, text("kept")), (cols[1].id, text(marker))])
             .unwrap();
+        // Most of the file is kept data, so the copy is not compacted again and the
+        // zeroing of freed pages is what keeps the secret out.
+        book.conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200)
+                 INSERT INTO \"T\" (\"a\") SELECT hex(randomblob(500)) FROM n;",
+            )
+            .unwrap();
         book.delete_column(cols[1].id).unwrap();
 
         let saved = dir.path().join("saved.xel");
         book.save_copy(&saved).unwrap();
         assert_eq!(trash_tables(&saved), 0);
+        let free: i64 = Connection::open(&saved)
+            .unwrap()
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap();
+        assert!(free > 0, "this test is meant to cover the uncompacted path");
         let bytes = std::fs::read(&saved).unwrap();
         assert!(
             !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
@@ -766,6 +800,18 @@ mod tests {
             Err(Error::AlreadyExists(_))
         ));
         assert_eq!(std::fs::read(&taken).unwrap(), b"someone else's");
+
+        let free = dir.path().join("free.xel");
+        std::fs::write(sidecar(&free, "-journal"), b"another file's journal").unwrap();
+        assert!(matches!(
+            book.save_copy(&free),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(!free.exists());
+        assert_eq!(
+            std::fs::read(sidecar(&free, "-journal")).unwrap(),
+            b"another file's journal"
+        );
     }
 
     #[test]
@@ -784,6 +830,13 @@ mod tests {
         let crashed = dir.path().join("crashed.xel");
         std::fs::copy(&path, &crashed).unwrap();
         std::fs::copy(sidecar(&path, "-journal"), sidecar(&crashed, "-journal")).unwrap();
+        let locked_crash = dir.path().join("locked-crash.xel");
+        std::fs::copy(&path, &locked_crash).unwrap();
+        std::fs::copy(
+            sidecar(&path, "-journal"),
+            sidecar(&locked_crash, "-journal"),
+        )
+        .unwrap();
         drop(writer);
 
         let working = dir.path().join("working.xel");
@@ -801,11 +854,61 @@ mod tests {
             .unwrap();
         assert_eq!(big, 0, "the copy has the last committed state");
 
+        std::fs::set_permissions(&locked_crash, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let fresh = dir.path().join("never-made.xel");
+        assert!(matches!(
+            Workbook::open_copy(&locked_crash, &fresh),
+            Err(Error::ReadOnly(_))
+        ));
+        assert!(!fresh.exists());
+
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
         let before = std::fs::read(&path).unwrap();
         let mut book = Workbook::open_copy(&path, dir.path().join("from-locked.xel")).unwrap();
         book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn open_copy_never_writes_to_the_original() {
+        let dir = TempDir::new();
+        let path = created(&dir);
+        // Another tool crashed with the file in WAL mode and changes not yet checkpointed:
+        // copy the file and its WAL while that tool still holds them.
+        let other = Connection::open(&path).unwrap();
+        other.pragma_update(None, "journal_mode", "wal").unwrap();
+        other.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        other.execute_batch("CREATE TABLE in_wal (x);").unwrap();
+        let doc = dir.path().join("crashed-wal.xel");
+        std::fs::copy(&path, &doc).unwrap();
+        std::fs::copy(sidecar(&path, "-wal"), sidecar(&doc, "-wal")).unwrap();
+        drop(other);
+        let before = std::fs::read(&doc).unwrap();
+
+        let working = dir.path().join("working.xel");
+        let book = Workbook::open_copy(&doc, &working).unwrap();
+        let copied: i64 = book
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'in_wal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied, 1, "the copy sees the WAL's changes");
+        book.close().unwrap();
+        assert_eq!(
+            std::fs::read(&doc).unwrap(),
+            before,
+            "nothing was checkpointed into it"
+        );
+        assert!(sidecar(&doc, "-wal").exists());
+
+        assert!(matches!(
+            Workbook::open_copy(dir.path().join("missing.xel"), dir.path().join("w2.xel")),
+            Err(Error::NotFound(_))
+        ));
+        assert!(!dir.path().join("w2.xel").exists());
     }
 
     const SAVE_LOOP_DIR: &str = "XEL_TEST_SAVE_LOOP_DIR";
@@ -832,7 +935,6 @@ mod tests {
             )
             .unwrap();
         book.delete_table(waste).unwrap();
-        std::fs::write(dir.join("ready"), b"").unwrap();
         // Saves until the parent kills it; nothing else ends this loop.
         let mut i = 0_u64;
         loop {
@@ -844,6 +946,10 @@ mod tests {
             let saving = dir.join(format!("saving-{i}.xel"));
             book.save_copy(&saving).unwrap();
             std::fs::rename(&saving, &doc).unwrap();
+            if i == 0 {
+                // After one completed save, so a slow machine cannot make the kills miss.
+                std::fs::write(dir.join("ready"), b"").unwrap();
+            }
             i += 1;
         }
     }
@@ -888,7 +994,7 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(1));
             }
-            // Spread the kills across the save cycle.
+            // Spread the kills across the save cycles that follow.
             std::thread::sleep(Duration::from_millis(5 + round * 7 % 60));
             assert!(
                 child.try_wait().unwrap().is_none(),
@@ -905,7 +1011,7 @@ mod tests {
                 }
                 let name = path.file_name().unwrap().to_string_lossy().into_owned();
                 partial |= name.starts_with("saving-");
-                // Clear what the app's temporary directory would hold, as a relaunch does.
+                // Clear the leftovers, as the document layer's temporary directory would be.
                 std::fs::remove_file(&path).unwrap();
             }
             mid_save += u32::from(partial);
