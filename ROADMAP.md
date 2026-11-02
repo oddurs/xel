@@ -4,34 +4,22 @@
 
 ## v0.1 — Typed tables, saved as SQLite
 
-`#·········` 5% · 2 of 37 done · due 2027-01-31
+`#####·····` 46% · 18 of 39 done · due 2027-01-31
 
 A Mac user downloads xel, builds a workbook of typed tables (typed in or imported from CSV), computes with Excel-style column formulas and total rows, and saves a .xel file that `sqlite3` reads directly.
 
+### backlog
+
+- [ ] [`0127`](https://github.com/oddurs/xel/blob/main/cairn/items/0127-ffi-tests-clean-up-their-temporary-directories.md) FFI tests clean up their temporary directories <sup>chore · p3 · bridge</sup>
+
 ### planned
 
-- [ ] [`0007`](https://github.com/oddurs/xel/blob/main/cairn/items/0007-choose-the-rust-to-swift-bridge.md) Choose the Rust-to-Swift bridge <sup>spike · p0 · bridge</sup>
-- [ ] [`0008`](https://github.com/oddurs/xel/blob/main/cairn/items/0008-choose-how-the-grid-renders-a-million-rows.md) Choose how the grid renders a million rows <sup>spike · p0 · grid</sup>
-- [ ] [`0010`](https://github.com/oddurs/xel/blob/main/cairn/items/0010-decide-where-formula-column-values-live.md) Decide where formula column values live <sup>spike · p0 · recalc</sup>
-- [ ] [`0011`](https://github.com/oddurs/xel/blob/main/cairn/items/0011-prove-nsdocument-can-own-a-sqlite-file-safely.md) Prove NSDocument can own a SQLite file safely <sup>spike · p0 · app</sup>
-- [ ] [`0014`](https://github.com/oddurs/xel/blob/main/cairn/items/0014-typed-tables-stored-as-real-sql-tables.md) Typed tables stored as real SQL tables <sup>feature · p0 · format</sup>
-- [ ] [`0015`](https://github.com/oddurs/xel/blob/main/cairn/items/0015-insert-edit-and-delete-rows-with-type-checking.md) Insert, edit, and delete rows with type checking <sup>feature · p0 · format</sup>
-- [ ] [`0016`](https://github.com/oddurs/xel/blob/main/cairn/items/0016-undo-and-redo-for-every-engine-edit.md) Undo and redo for every engine edit <sup>feature · p0 · format</sup>
 - [ ] [`0017`](https://github.com/oddurs/xel/blob/main/cairn/items/0017-number-and-date-display-formats-per-column.md) Number and date display formats per column <sup>feature · p1 · format</sup>
 - [ ] [`0018`](https://github.com/oddurs/xel/blob/main/cairn/items/0018-document-the-v0-file-format.md) Document the v0 file format <sup>docs · p1 · docs</sup>
-- [ ] [`0019`](https://github.com/oddurs/xel/blob/main/cairn/items/0019-parse-excel-formula-syntax.md) Parse Excel formula syntax <sup>feature · p0 · formula</sup>
-- [ ] [`0020`](https://github.com/oddurs/xel/blob/main/cairn/items/0020-formula-values-errors-and-excel-coercion.md) Formula values, errors, and Excel coercion <sup>feature · p0 · formula</sup>
-- [ ] [`0021`](https://github.com/oddurs/xel/blob/main/cairn/items/0021-evaluate-formulas-in-a-table-row.md) Evaluate formulas in a table row <sup>feature · p0 · formula</sup>
-- [ ] [`0022`](https://github.com/oddurs/xel/blob/main/cairn/items/0022-math-logic-and-aggregate-functions.md) Math, logic, and aggregate functions <sup>feature · p0 · formula</sup>
 - [ ] [`0023`](https://github.com/oddurs/xel/blob/main/cairn/items/0023-text-and-date-functions.md) Text and date functions <sup>feature · p1 · formula</sup>
 - [ ] [`0024`](https://github.com/oddurs/xel/blob/main/cairn/items/0024-excel-conformance-test-harness.md) Excel conformance test harness <sup>chore · p1 · formula</sup>
-- [ ] [`0025`](https://github.com/oddurs/xel/blob/main/cairn/items/0025-formula-columns.md) Formula columns <sup>feature · p0 · recalc</sup>
-- [ ] [`0026`](https://github.com/oddurs/xel/blob/main/cairn/items/0026-total-row-with-aggregate-formulas.md) Total row with aggregate formulas <sup>feature · p0 · recalc</sup>
 - [ ] [`0027`](https://github.com/oddurs/xel/blob/main/cairn/items/0027-incremental-recalculation-and-cycle-detection.md) Incremental recalculation and cycle detection <sup>feature · p1 · recalc</sup>
-- [ ] [`0028`](https://github.com/oddurs/xel/blob/main/cairn/items/0028-engine-api-for-the-app.md) Engine API for the app <sup>feature · p0 · bridge</sup>
-- [ ] [`0029`](https://github.com/oddurs/xel/blob/main/cairn/items/0029-build-and-link-the-engine-into-the-app.md) Build and link the engine into the app <sup>chore · p0 · infra</sup>
 - [ ] [`0030`](https://github.com/oddurs/xel/blob/main/cairn/items/0030-swift-test-target-that-runs-locally-and-in-ci.md) Swift test target that runs locally and in CI <sup>chore · p1 · infra</sup>
-- [ ] [`0031`](https://github.com/oddurs/xel/blob/main/cairn/items/0031-document-based-app-for-xel-files.md) Document-based app for .xel files <sup>feature · p0 · app</sup>
 - [ ] [`0032`](https://github.com/oddurs/xel/blob/main/cairn/items/0032-sidebar-table-management-and-inspector.md) Sidebar, table management, and inspector <sup>feature · p0 · app</sup>
 - [ ] [`0033`](https://github.com/oddurs/xel/blob/main/cairn/items/0033-virtualized-grid-view.md) Virtualized grid view <sup>feature · p0 · grid</sup>
 - [ ] [`0034`](https://github.com/oddurs/xel/blob/main/cairn/items/0034-selection-and-keyboard-navigation.md) Selection and keyboard navigation <sup>feature · p0 · grid</sup>
@@ -43,20 +31,37 @@ A Mac user downloads xel, builds a workbook of typed tables (typed in or importe
 - [ ] [`0041`](https://github.com/oddurs/xel/blob/main/cairn/items/0041-import-csv-with-type-inference.md) Import CSV with type inference <sup>feature · p1 · interop</sup>
 - [ ] [`0042`](https://github.com/oddurs/xel/blob/main/cairn/items/0042-release-workflow-for-notarized-builds.md) Release workflow for notarized builds <sup>chore · p0 · infra</sup>
 - [ ] [`0043`](https://github.com/oddurs/xel/blob/main/cairn/items/0043-quickstart-for-v0-1-users.md) Quickstart for v0.1 users <sup>docs · p0 · docs</sup>
-- [ ] [`0118`](https://github.com/oddurs/xel/blob/main/cairn/items/0118-bundle-xel-app-with-document-types-and-ad-hoc-signing.md) Bundle Xel.app with document types and ad-hoc signing <sup>chore · p0 · infra</sup>
+- [ ] [`0125`](https://github.com/oddurs/xel/blob/main/cairn/items/0125-rewrite-formulas-when-a-referenced-column-or-table-is-renamed.md) Rewrite formulas when a referenced column or table is renamed <sup>feature · p1 · formula</sup>
 
 ### blocked
 
 - [ ] [`0012`](https://github.com/oddurs/xel/blob/main/cairn/items/0012-ship-a-signed-notarized-app-from-ci.md) Ship a signed, notarized .app from CI <sup>spike · p0 · infra</sup>
+- [ ] [`0031`](https://github.com/oddurs/xel/blob/main/cairn/items/0031-document-based-app-for-xel-files.md) Document-based app for .xel files <sup>feature · p0 · app</sup>
 
 ### done
 
+- [x] [`0007`](https://github.com/oddurs/xel/blob/main/cairn/items/0007-choose-the-rust-to-swift-bridge.md) Choose the Rust-to-Swift bridge <sup>spike · p0 · bridge</sup>
+- [x] [`0008`](https://github.com/oddurs/xel/blob/main/cairn/items/0008-choose-how-the-grid-renders-a-million-rows.md) Choose how the grid renders a million rows <sup>spike · p0 · grid</sup>
 - [x] [`0009`](https://github.com/oddurs/xel/blob/main/cairn/items/0009-decide-the-number-model.md) Decide the number model <sup>spike · p0 · formula</sup>
+- [x] [`0010`](https://github.com/oddurs/xel/blob/main/cairn/items/0010-decide-where-formula-column-values-live.md) Decide where formula column values live <sup>spike · p0 · recalc</sup>
+- [x] [`0011`](https://github.com/oddurs/xel/blob/main/cairn/items/0011-prove-nsdocument-can-own-a-sqlite-file-safely.md) Prove NSDocument can own a SQLite file safely <sup>spike · p0 · app</sup>
 - [x] [`0013`](https://github.com/oddurs/xel/blob/main/cairn/items/0013-create-and-open-xel-workbooks-as-sqlite-files.md) Create and open .xel workbooks as SQLite files <sup>feature · p0 · format</sup>
+- [x] [`0014`](https://github.com/oddurs/xel/blob/main/cairn/items/0014-typed-tables-stored-as-real-sql-tables.md) Typed tables stored as real SQL tables <sup>feature · p0 · format</sup>
+- [x] [`0015`](https://github.com/oddurs/xel/blob/main/cairn/items/0015-insert-edit-and-delete-rows-with-type-checking.md) Insert, edit, and delete rows with type checking <sup>feature · p0 · format</sup>
+- [x] [`0016`](https://github.com/oddurs/xel/blob/main/cairn/items/0016-undo-and-redo-for-every-engine-edit.md) Undo and redo for every engine edit <sup>feature · p0 · format</sup>
+- [x] [`0019`](https://github.com/oddurs/xel/blob/main/cairn/items/0019-parse-excel-formula-syntax.md) Parse Excel formula syntax <sup>feature · p0 · formula</sup>
+- [x] [`0020`](https://github.com/oddurs/xel/blob/main/cairn/items/0020-formula-values-errors-and-excel-coercion.md) Formula values, errors, and Excel coercion <sup>feature · p0 · formula</sup>
+- [x] [`0021`](https://github.com/oddurs/xel/blob/main/cairn/items/0021-evaluate-formulas-in-a-table-row.md) Evaluate formulas in a table row <sup>feature · p0 · formula</sup>
+- [x] [`0022`](https://github.com/oddurs/xel/blob/main/cairn/items/0022-math-logic-and-aggregate-functions.md) Math, logic, and aggregate functions <sup>feature · p0 · formula</sup>
+- [x] [`0025`](https://github.com/oddurs/xel/blob/main/cairn/items/0025-formula-columns.md) Formula columns <sup>feature · p0 · recalc</sup>
+- [x] [`0026`](https://github.com/oddurs/xel/blob/main/cairn/items/0026-total-row-with-aggregate-formulas.md) Total row with aggregate formulas <sup>feature · p0 · recalc</sup>
+- [x] [`0028`](https://github.com/oddurs/xel/blob/main/cairn/items/0028-engine-api-for-the-app.md) Engine API for the app <sup>feature · p0 · bridge</sup>
+- [x] [`0029`](https://github.com/oddurs/xel/blob/main/cairn/items/0029-build-and-link-the-engine-into-the-app.md) Build and link the engine into the app <sup>chore · p0 · infra</sup>
+- [x] [`0118`](https://github.com/oddurs/xel/blob/main/cairn/items/0118-bundle-xel-app-with-document-types-and-ad-hoc-signing.md) Bundle Xel.app with document types and ad-hoc signing <sup>chore · p0 · infra</sup>
 
 ## v0.2 — Linked tables, SQL, and free cells
 
-`··········` 0% · 0 of 17 done · due 2027-04-15
+`··········` 0% · 0 of 20 done · due 2027-04-15
 
 Workbooks become relational: tables link to each other, SQL query blocks compute over them, sheets hold free A1 cells beside tables, and each table has saved filtered, sorted, and grouped views.
 
@@ -79,10 +84,13 @@ Workbooks become relational: tables link to each other, SQL query blocks compute
 - [ ] [`0057`](https://github.com/oddurs/xel/blob/main/cairn/items/0057-expanded-record-view.md) Expanded record view <sup>feature · p1 · app</sup>
 - [ ] [`0058`](https://github.com/oddurs/xel/blob/main/cairn/items/0058-more-field-types.md) More field types <sup>feature · p1 · format</sup>
 - [ ] [`0059`](https://github.com/oddurs/xel/blob/main/cairn/items/0059-export-a-table-or-view-as-csv.md) Export a table or view as CSV <sup>feature · p2 · interop</sup>
+- [ ] [`0119`](https://github.com/oddurs/xel/blob/main/cairn/items/0119-parse-whole-column-ranges-whole-row-ranges-and-sheet-references.md) Parse whole-column ranges, whole-row ranges, and sheet references <sup>feature · p0 · formula</sup>
+- [ ] [`0123`](https://github.com/oddurs/xel/blob/main/cairn/items/0123-keep-deleted-rows-in-trash-instead-of-memory.md) Keep deleted rows in trash instead of memory <sup>feature · p2 · format</sup>
+- [ ] [`0126`](https://github.com/oddurs/xel/blob/main/cairn/items/0126-recover-unsaved-edits-after-a-crash.md) Recover unsaved edits after a crash <sup>feature · p2 · app</sup>
 
 ## v0.3 — The Excel bridge
 
-`··········` 0% · 0 of 18 done · due 2027-08-15
+`··········` 0% · 0 of 21 done · due 2027-08-15
 
 xel works alongside Excel: open an .xlsx, keep working in typed tables, summarize with pivot tables, export back to .xlsx with a report of anything that became static, and copy and paste formulas between the two.
 
@@ -106,6 +114,9 @@ xel works alongside Excel: open an .xlsx, keep working in typed tables, summariz
 - [ ] [`0109`](https://github.com/oddurs/xel/blob/main/cairn/items/0109-pivot-tables-over-tables-and-views.md) Pivot tables over tables and views <sup>feature · p0 · query</sup>
 - [ ] [`0110`](https://github.com/oddurs/xel/blob/main/cairn/items/0110-pivot-field-wells-and-layout.md) Pivot field wells and layout <sup>feature · p0 · app</sup>
 - [ ] [`0111`](https://github.com/oddurs/xel/blob/main/cairn/items/0111-pivot-tables-in-xlsx-import-and-export.md) Pivot tables in xlsx import and export <sup>feature · p1 · interop</sup>
+- [ ] [`0120`](https://github.com/oddurs/xel/blob/main/cairn/items/0120-parse-array-constants-spill-references-special-table-items-and-newer-error-values.md) Parse array constants, @, spill references, special table items, and newer error values <sup>feature · p0 · formula</sup>
+- [ ] [`0121`](https://github.com/oddurs/xel/blob/main/cairn/items/0121-compare-and-sort-text-with-excel-s-collation.md) Compare and sort text with Excel's collation <sup>feature · p2 · formula</sup>
+- [ ] [`0122`](https://github.com/oddurs/xel/blob/main/cairn/items/0122-accept-excel-s-date-and-time-text-in-arithmetic.md) Accept Excel's date and time text in arithmetic <sup>feature · p1 · formula</sup>
 
 ## v0.4 — Python, charts, and provenance
 
@@ -139,7 +150,7 @@ xel becomes a development environment with charts: Python blocks run inside work
 
 ## v1.0 — The promise
 
-`··········` 0% · 0 of 10 done · due 2028-01-31
+`··········` 0% · 0 of 11 done · due 2028-01-31
 
 The promise: an Excel user can open an .xlsx in xel, work with it as typed, linked tables using Excel formulas, SQL, Python, pivot tables, and charts, and save a .xel file any SQLite tool can read, with a file format and Python API that will not break without a major version.
 
@@ -155,6 +166,7 @@ The promise: an Excel user can open an .xlsx in xel, work with it as typed, link
 - [ ] [`0098`](https://github.com/oddurs/xel/blob/main/cairn/items/0098-function-reference-generated-from-the-registry.md) Function reference generated from the registry <sup>docs · p0 · docs</sup>
 - [ ] [`0099`](https://github.com/oddurs/xel/blob/main/cairn/items/0099-architecture-guide-for-contributors.md) Architecture guide for contributors <sup>docs · p1 · docs</sup>
 - [ ] [`0100`](https://github.com/oddurs/xel/blob/main/cairn/items/0100-release-1-0.md) Release 1.0 <sup>chore · p0 · infra</sup>
+- [ ] [`0124`](https://github.com/oddurs/xel/blob/main/cairn/items/0124-drop-trash-left-by-sessions-that-crashed.md) Drop trash left by sessions that crashed <sup>chore · p2 · format</sup>
 
 ## later — Not on the path to 1.0
 
