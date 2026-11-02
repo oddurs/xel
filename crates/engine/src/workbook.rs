@@ -120,6 +120,37 @@ impl Workbook {
         Self::configure(conn, format_version)
     }
 
+    /// Opens `src` and makes a private working copy of it at `working`, which must not
+    /// exist yet. The returned workbook edits the copy; the macOS document layer leaves the
+    /// user's file untouched until it saves with [`save_copy`](Self::save_copy), so
+    /// autosave, Versions, and iCloud only ever see complete files.
+    ///
+    /// A crash journal beside the original is rolled back first, which a byte-for-byte
+    /// copy would not do. A write-protected original (a locked document) is only read.
+    pub fn open_copy(src: impl AsRef<Path>, working: impl AsRef<Path>) -> Result<Self> {
+        match Self::open(src.as_ref()) {
+            Ok(original) => {
+                write_copy(&original.conn, working.as_ref())?;
+                original.close()?;
+            }
+            Err(Error::ReadOnly(src)) => {
+                let original = Connection::open_with_flags(&src, READ_ONLY)?;
+                identify(&original, &src)?;
+                write_copy(&original, working.as_ref())?;
+            }
+            Err(e) => return Err(e),
+        }
+        Self::open(working)
+    }
+
+    /// Writes a complete, synced copy of this workbook to `dest`, which must not exist yet,
+    /// without the undo trash this session keeps. The document layer writes to a fresh
+    /// temporary file and moves it into place, so a crash part-way leaves the user's file
+    /// as it was.
+    pub fn save_copy(&self, dest: impl AsRef<Path>) -> Result<()> {
+        write_copy(&self.conn, dest.as_ref())
+    }
+
     /// The format version recorded in the file when it was opened.
     pub fn format_version(&self) -> u32 {
         self.format_version
@@ -201,6 +232,55 @@ fn identify(conn: &Connection, path: &Path) -> Result<u32> {
 /// (permission denied). This runs only after SQLite has failed to open the file, so no
 /// connection in this process holds locks on it: opening and closing another descriptor
 /// would otherwise release them, as POSIX locks are per process.
+/// Writes a compacted copy of `conn`'s database to `dest`, which must not exist yet.
+fn write_copy(conn: &Connection, dest: &Path) -> Result<()> {
+    let dest = &sqlite_path(dest)?;
+    let io = |e: std::io::Error| match e.kind() {
+        IoErrorKind::AlreadyExists => Error::AlreadyExists(dest.clone()),
+        _ => Error::Io {
+            path: dest.clone(),
+            source: e,
+        },
+    };
+    let name = dest.to_str().ok_or_else(|| {
+        io(std::io::Error::new(
+            IoErrorKind::InvalidInput,
+            "SQLite needs a UTF-8 path",
+        ))
+    })?;
+    // Creating the file first claims the name, so a failure below removes only our file.
+    // VACUUM INTO accepts an empty file.
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .map_err(io)?;
+    let written = conn
+        .execute("VACUUM INTO ?1", [name])
+        .map_err(Error::from)
+        .and_then(|_| drop_trash(dest))
+        // VACUUM INTO does not sync; the copy must be on disk before it replaces the
+        // user's file. On macOS this is F_FULLFSYNC.
+        .and_then(|()| file.sync_all().map_err(io));
+    if written.is_err() {
+        // A partial copy must not look like a finished one. The copy's error is the one
+        // worth reporting; failing to remove the partial file as well changes nothing the
+        // caller can act on.
+        let _ = std::fs::remove_file(dest);
+    }
+    written
+}
+
+/// Removes undo trash from a fresh copy. Trash is a session's undo state, not part of the
+/// document, and the copy is vacuumed again so deleted data does not linger in free pages.
+fn drop_trash(copy: &Path) -> Result<()> {
+    let conn = Connection::open_with_flags(copy, READ_WRITE)?;
+    if crate::history::drop_all_trash(&conn)? {
+        conn.execute_batch("VACUUM;")?;
+    }
+    conn.close().map_err(|(_, e)| e.into())
+}
+
 fn explain_cannot_open(e: rusqlite::Error, path: &Path) -> Error {
     if matches!(e.sqlite_error_code(), Some(ErrorCode::CannotOpen))
         && let Err(io) = std::fs::File::open(path)
@@ -238,9 +318,12 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::test_support::TempDir;
+    use crate::{CellValue, ColumnType};
 
     fn created(dir: &TempDir) -> PathBuf {
         let path = dir.path().join("book.xel");
@@ -585,5 +668,268 @@ mod tests {
             matches!(&err, Error::Io { source, .. } if source.kind() == IoErrorKind::PermissionDenied),
             "permission problem reported as {err}"
         );
+    }
+
+    fn trash_tables(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name GLOB 'xel_trash_*'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn text(s: &str) -> CellValue {
+        CellValue::Text(s.into())
+    }
+
+    #[test]
+    fn a_working_copy_leaves_the_original_untouched_until_saved() {
+        let dir = TempDir::new();
+        let doc = dir.path().join("doc.xel");
+        let mut book = Workbook::create(&doc).unwrap();
+        let t = book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        let a = book.table(t).unwrap().columns[0].id;
+        book.insert_row(t, &[(a, text("one"))]).unwrap();
+        book.close().unwrap();
+        let before = std::fs::read(&doc).unwrap();
+
+        let working = dir.path().join("working.xel");
+        let mut book = Workbook::open_copy(&doc, &working).unwrap();
+        book.insert_row(t, &[(a, text("two"))]).unwrap();
+        assert_eq!(
+            std::fs::read(&doc).unwrap(),
+            before,
+            "edits stay in the copy"
+        );
+
+        let saved = dir.path().join("saved.xel");
+        book.save_copy(&saved).unwrap();
+        std::fs::rename(&saved, &doc).unwrap();
+        book.insert_row(t, &[(a, text("three"))]).unwrap();
+        book.close().unwrap();
+        let reopened = Workbook::open(&doc).unwrap();
+        assert_eq!(reopened.row_count(t).unwrap(), 2, "the save is a snapshot");
+    }
+
+    #[test]
+    fn saved_copies_leave_out_undo_trash_and_the_data_it_held() {
+        let dir = TempDir::new();
+        let mut book = Workbook::create(dir.path().join("doc.xel")).unwrap();
+        let t = book
+            .create_table(
+                "T",
+                &[("a", ColumnType::Text), ("secret", ColumnType::Text)],
+            )
+            .unwrap();
+        let cols = book.table(t).unwrap().columns;
+        let marker = "deleted-secret-marker";
+        book.insert_row(t, &[(cols[0].id, text("kept")), (cols[1].id, text(marker))])
+            .unwrap();
+        book.delete_column(cols[1].id).unwrap();
+
+        let saved = dir.path().join("saved.xel");
+        book.save_copy(&saved).unwrap();
+        assert_eq!(trash_tables(&saved), 0);
+        let bytes = std::fs::read(&saved).unwrap();
+        assert!(
+            !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+            "deleted data is not left in the saved file's free pages"
+        );
+
+        book.undo().unwrap();
+        assert_eq!(
+            book.table(t).unwrap().columns.len(),
+            2,
+            "the session's own undo still works after a save"
+        );
+        let copy = Workbook::open(&saved).unwrap();
+        assert_eq!(copy.table(t).unwrap().columns.len(), 1);
+    }
+
+    #[test]
+    fn copies_never_overwrite() {
+        let dir = TempDir::new();
+        let doc = created(&dir);
+        let taken = dir.path().join("taken.xel");
+        std::fs::write(&taken, b"someone else's").unwrap();
+
+        let book = Workbook::open(&doc).unwrap();
+        assert!(matches!(
+            book.save_copy(&taken),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            Workbook::open_copy(&doc, &taken),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert_eq!(std::fs::read(&taken).unwrap(), b"someone else's");
+    }
+
+    #[test]
+    fn open_copy_recovers_a_crashed_original_and_reads_a_locked_one() {
+        let dir = TempDir::new();
+        let path = created(&dir);
+        let writer = Connection::open(&path).unwrap();
+        writer.pragma_update(None, "cache_size", 1).unwrap();
+        writer
+            .execute_batch(
+                "BEGIN; CREATE TABLE big (x);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200)
+                 INSERT INTO big SELECT randomblob(4000) FROM n;",
+            )
+            .unwrap();
+        let crashed = dir.path().join("crashed.xel");
+        std::fs::copy(&path, &crashed).unwrap();
+        std::fs::copy(sidecar(&path, "-journal"), sidecar(&crashed, "-journal")).unwrap();
+        drop(writer);
+
+        let working = dir.path().join("working.xel");
+        Workbook::open_copy(&crashed, &working)
+            .unwrap()
+            .close()
+            .unwrap();
+        let big: i64 = Connection::open(&working)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'big'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(big, 0, "the copy has the last committed state");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut book = Workbook::open_copy(&path, dir.path().join("from-locked.xel")).unwrap();
+        book.create_table("T", &[("a", ColumnType::Text)]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    const SAVE_LOOP_DIR: &str = "XEL_TEST_SAVE_LOOP_DIR";
+
+    /// The child half of `a_kill_during_save_never_damages_the_document`: edits a working
+    /// copy and saves it over the document the way the app does, until it is killed.
+    #[test]
+    #[ignore = "run by a_kill_during_save_never_damages_the_document"]
+    fn save_until_killed() {
+        let Some(dir) = std::env::var_os(SAVE_LOOP_DIR).map(PathBuf::from) else {
+            return;
+        };
+        let doc = dir.join("doc.xel");
+        let mut book = Workbook::open_copy(&doc, dir.join("working.xel")).unwrap();
+        let table = book.tables().unwrap().remove(0);
+        // Deleted data in the undo trash makes every save take its longest path.
+        let waste = book
+            .create_table("Waste", &[("x", ColumnType::Text)])
+            .unwrap();
+        book.conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+                 INSERT INTO \"Waste\" (\"x\") SELECT hex(randomblob(2000)) FROM n;",
+            )
+            .unwrap();
+        book.delete_table(waste).unwrap();
+        std::fs::write(dir.join("ready"), b"").unwrap();
+        // Saves until the parent kills it; nothing else ends this loop.
+        let mut i = 0_u64;
+        loop {
+            book.insert_row(
+                table.id,
+                &[(table.columns[0].id, text(&format!("save {i}")))],
+            )
+            .unwrap();
+            let saving = dir.join(format!("saving-{i}.xel"));
+            book.save_copy(&saving).unwrap();
+            std::fs::rename(&saving, &doc).unwrap();
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn a_kill_during_save_never_damages_the_document() {
+        let dir = TempDir::new();
+        let doc = dir.path().join("doc.xel");
+        let mut book = Workbook::create(&doc).unwrap();
+        let t = book
+            .create_table(
+                "T",
+                &[("saved", ColumnType::Text), ("filler", ColumnType::Text)],
+            )
+            .unwrap();
+        // Enough data that a save takes milliseconds, so kills land inside one.
+        book.conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+                 INSERT INTO \"T\" (\"filler\") SELECT hex(randomblob(1000)) FROM n;",
+            )
+            .unwrap();
+        book.close().unwrap();
+        let initial = 1000;
+
+        let exe = std::env::current_exe().unwrap();
+        let ready = dir.path().join("ready");
+        let (mut mid_save, mut last) = (0, initial);
+        for round in 0..20_u64 {
+            let mut child = Command::new(&exe)
+                .args(["--exact", "workbook::tests::save_until_killed", "--ignored"])
+                .env(SAVE_LOOP_DIR, dir.path())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            while !ready.exists() {
+                assert!(child.try_wait().unwrap().is_none(), "the child failed");
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "the child never started"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Spread the kills across the save cycle.
+            std::thread::sleep(Duration::from_millis(5 + round * 7 % 60));
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the child stopped saving"
+            );
+            child.kill().unwrap();
+            child.wait().unwrap();
+
+            let mut partial = false;
+            for entry in std::fs::read_dir(dir.path()).unwrap() {
+                let path = entry.unwrap().path();
+                if path == doc {
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                partial |= name.starts_with("saving-");
+                // Clear what the app's temporary directory would hold, as a relaunch does.
+                std::fs::remove_file(&path).unwrap();
+            }
+            mid_save += u32::from(partial);
+
+            let book = Workbook::open(&doc).unwrap();
+            let rows = book.row_count(t).unwrap();
+            assert!(
+                rows >= last,
+                "round {round}: saved rows went from {last} to {rows}"
+            );
+            last = rows;
+            book.close().unwrap();
+            let check: String = Connection::open(&doc)
+                .unwrap()
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(check, "ok", "round {round}");
+            assert_eq!(trash_tables(&doc), 0, "round {round}");
+        }
+        eprintln!(
+            "20 kills: {mid_save} inside a save; {} saves completed",
+            last - initial
+        );
+        assert!(mid_save > 0, "no kill landed inside a save");
+        assert!(last > initial, "no save completed");
     }
 }

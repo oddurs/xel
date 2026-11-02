@@ -362,6 +362,19 @@ impl Workbook {
     }
 }
 
+/// Drops every session's trash and says whether there was any. Only for a copy no session
+/// works in.
+pub(crate) fn drop_all_trash(conn: &Connection) -> Result<bool> {
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name GLOB 'xel_trash_*'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for name in &names {
+        conn.execute_batch(&format!("DROP TABLE {};", quote(name)))?;
+    }
+    Ok(!names.is_empty())
+}
+
 fn release(conn: &Connection, change: &Change, session: Session) -> Result<()> {
     if let Some(trash) = change.trash(session) {
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {};", quote(&trash)))?;

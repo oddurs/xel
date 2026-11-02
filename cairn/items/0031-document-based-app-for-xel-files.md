@@ -29,3 +29,7 @@ Make the app document-based with a `.xel` file type: New, Open, Save, Revert, Op
 - [ ] Double-clicking a .xel file in Finder opens it in xel
 - [ ] Quitting with unsaved changes follows standard macOS behavior
 - [ ] Killing the app during save leaves either the old or the new file, never a corrupt one, covered by a test
+- [ ] Uses an AppKit NSDocument over `open_copy`/`save_copy` as 0011 answers; the working copy lives in a per-document temporary directory and is removed on close
+- [ ] Revert to Saved, and browsing and restoring a version in the Versions browser, show the right data (checked by hand, steps in the PR)
+- [ ] Replacing the file from outside while it is open (as iCloud would) reloads it instead of overwriting it
+- [ ] `LSHandlerRank` in `app/Bundle/Info.plist` is `Owner`
