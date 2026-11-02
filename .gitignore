@@ -22,3 +22,4 @@ DerivedData/
 .idea/
 .vscode/
 *.swp
+/spikes/*/.build/
