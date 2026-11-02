@@ -3,8 +3,10 @@ id: 26
 uid: 744f640d-561e-42a3-8603-9c216b3dc5b0
 title: Total row with aggregate formulas
 type: feature
-status: planned
+status: doing
 milestone: v0.1
+assignee: Oddur Sigurdsson
+claimed: 2026-11-01
 depends_on:
 - 22
 - 25

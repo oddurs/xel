@@ -1,7 +1,7 @@
 //! Aggregates and arithmetic: SUM, AVERAGE, MIN, MAX, COUNT, COUNTA, COUNTBLANK, ROUND,
 //! ROUNDUP, ROUNDDOWN, INT, MOD, ABS, POWER, SQRT.
 
-use super::{each_value, integer, numbers, result, value};
+use super::{each_value, integer, numbers, numbers_and_dates, result, value};
 use crate::formula::ast::{BinaryOp, ErrorKind};
 use crate::formula::eval::{Arg, Args};
 use crate::formula::value::{Value, binary, number_from_text, round15};
@@ -20,9 +20,16 @@ pub(super) fn average<'a>(args: &Args<'a>) -> Arg<'a> {
     }))
 }
 
-/// MIN and MAX of nothing are 0, as in Excel.
+/// MIN and MAX of nothing are 0, as in Excel. The earliest or latest of dates is a date;
+/// Excel returns its serial and leaves the cell's format to show it as one.
 fn extreme(args: &Args<'_>, pick: fn(f64, f64) -> f64) -> Arg<'static> {
-    result(numbers(args).map(|ns| Value::number(ns.into_iter().reduce(pick).unwrap_or(0.0))))
+    result(
+        numbers_and_dates(args).map(|(ns, dates)| match ns.into_iter().reduce(pick) {
+            Some(n) if dates => Value::Date(n),
+            Some(n) => Value::number(n),
+            None => Value::Number(0.0),
+        }),
+    )
 }
 
 pub(super) fn min<'a>(args: &Args<'a>) -> Arg<'a> {

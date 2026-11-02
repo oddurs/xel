@@ -9,6 +9,9 @@
 //!   for every row when anything it reads changes. Parts of a formula that do not depend
 //!   on the row are evaluated once per pass, so `[@Qty]/SUM([Qty])` stays linear.
 //! - Formula, column, and table changes recompute every formula of the table.
+//!
+//! Column totals (see 0026) are recomputed after the formula columns, when anything they
+//! read changed, and stored in `xel_columns`.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
@@ -68,6 +71,8 @@ impl Scope {
 /// Recomputes whatever `changes` can have affected.
 pub(crate) fn after(conn: &Connection, changes: &[Change]) -> Result<()> {
     let mut scopes: HashMap<TableId, Scope> = HashMap::new();
+    // Totals whose own formula changed, beyond what the scopes reach.
+    let mut retotal: HashMap<TableId, BTreeSet<ColumnId>> = HashMap::new();
     let mut widen = |table: TableId, scope: Scope| match scopes.get_mut(&table) {
         Some(existing) => existing.widen(scope),
         None => {
@@ -99,11 +104,19 @@ pub(crate) fn after(conn: &Connection, changes: &[Change]) -> Result<()> {
                     Some(cells.iter().map(|c| c.column).collect()),
                 ),
             ),
+            Change::SetTotal { table, column, .. } => {
+                retotal.entry(*table).or_default().insert(*column);
+            }
             Change::DeleteTable { .. } | Change::SetOptions { .. } => {}
         }
     }
+    for table in retotal.keys() {
+        // Rows of no columns: no formula column is touched, only the totals named.
+        widen(*table, Scope::rows(BTreeSet::new(), Some(BTreeSet::new())));
+    }
+    let none = BTreeSet::new();
     for (table, scope) in scopes {
-        match run(conn, table, &scope) {
+        match run(conn, table, &scope, retotal.get(&table).unwrap_or(&none)) {
             // The table was deleted later in the same entry.
             Err(Error::NoSuchTable(_)) => {}
             other => other?,
@@ -132,17 +145,20 @@ fn lower(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
-/// Recomputes the formula columns of `table` for `scope`.
-pub(crate) fn run(conn: &Connection, table: TableId, scope: &Scope) -> Result<()> {
+/// Recomputes the formula columns and totals of `table` for `scope`, and the totals in
+/// `retotal` whatever the scope.
+pub(crate) fn run(
+    conn: &Connection,
+    table: TableId,
+    scope: &Scope,
+    retotal: &BTreeSet<ColumnId>,
+) -> Result<()> {
     let t = crate::schema::load_table(conn, table)?;
     let formulas: Vec<Formula<'_>> = t
         .columns
         .iter()
         .filter_map(|c| c.formula.as_ref().map(|text| analyze(c, text, &t.name)))
         .collect();
-    if formulas.is_empty() {
-        return Ok(());
-    }
     let index_of = |name: &str| formulas.iter().position(|f| lower(&f.column.name) == name);
     let (order, cyclic) = order(&formulas, &index_of);
 
@@ -206,7 +222,109 @@ pub(crate) fn run(conn: &Connection, table: TableId, scope: &Scope) -> Result<()
             )?;
         }
     }
+
+    // Totals reading an edited column or a recomputed formula column; all of them when
+    // rows came or went or the table changed shape.
+    let changed: Option<BTreeSet<String>> = match scope {
+        Scope::All | Scope::Rows { columns: None, .. } => None,
+        Scope::Rows {
+            columns: Some(columns),
+            ..
+        } => Some(
+            t.columns
+                .iter()
+                .filter(|c| columns.contains(&c.id))
+                .map(|c| lower(&c.name))
+                .chain(touched.iter().map(|&i| lower(&formulas[i].column.name)))
+                .collect(),
+        ),
+    };
+    for column in &t.columns {
+        let Some(text) = &column.total else { continue };
+        let total = analyze(column, text, &t.name);
+        let stale = retotal.contains(&column.id)
+            || changed
+                .as_ref()
+                .is_none_or(|names| total.reads().any(|n| names.contains(n)));
+        if stale {
+            compute_total(conn, &t, &total, &dates)?;
+        }
+    }
     Ok(())
+}
+
+/// Evaluates a column's total over whole columns and stores the result beside it.
+fn compute_total(
+    conn: &Connection,
+    t: &Table,
+    total: &Formula<'_>,
+    dates: &HashMap<ColumnId, bool>,
+) -> Result<()> {
+    let value = match &total.expr {
+        Some(expr) => {
+            let columns = whole_columns(conn, t, &total.whole, dates)?;
+            evaluate(
+                expr,
+                &RowContext {
+                    table: &t.name,
+                    row: &HashMap::new(),
+                    columns: &columns,
+                },
+            )
+        }
+        None => Value::Error(ErrorKind::Name),
+    };
+    conn.execute(
+        "UPDATE xel_columns SET total_value = ?1, total_kind = ?2 WHERE id = ?3",
+        rusqlite::params![
+            stored(&value),
+            matches!(value, Value::Date(_)).then_some("date"),
+            total.column.id.0
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether `expr` reads a single row (`[@Col]`) anywhere.
+pub(crate) fn reads_this_row(expr: &Expr) -> bool {
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Ref(Reference::Structured { this_row: true, .. }) => return true,
+            Expr::Unary { expr, .. } => stack.push(expr),
+            Expr::Binary { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::Call { args, .. } => stack.extend(args),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The values of the named columns of `t`, by lower-cased name, in row order.
+fn whole_columns(
+    conn: &Connection,
+    t: &Table,
+    names: &BTreeSet<String>,
+    dates: &HashMap<ColumnId, bool>,
+) -> Result<HashMap<String, Vec<Value>>> {
+    let tname = quote(&t.name);
+    let id = quote(ROW_ID);
+    let mut columns = HashMap::new();
+    for name in names {
+        if let Some(col) = t.columns.iter().find(|c| lower(&c.name) == *name) {
+            let is_dates = dates.get(&col.id).copied().unwrap_or(col.formula_dates);
+            let sql = format!("SELECT {} FROM {tname} ORDER BY {id}", quote(&col.name));
+            let mut stmt = conn.prepare(&sql)?;
+            let values = stmt
+                .query_map([], |r| Ok(formula_value(col.ty, is_dates, r.get_ref(0)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            columns.insert(name.clone(), values);
+        }
+    }
+    Ok(columns)
 }
 
 /// Orders formulas so each comes after the formulas it reads; returns the order and the
@@ -388,19 +506,7 @@ fn compute(
         return Ok(false);
     };
 
-    let mut columns = HashMap::new();
-    for name in &f.whole {
-        if let Some(col) = t.columns.iter().find(|c| lower(&c.name) == *name) {
-            let sql = format!("SELECT {} FROM {tname} ORDER BY {id}", quote(&col.name));
-            let mut stmt = conn.prepare(&sql)?;
-            let values = stmt
-                .query_map([], |r| {
-                    Ok(formula_value(col.ty, is_dates(col), r.get_ref(0)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            columns.insert(name.clone(), values);
-        }
-    }
+    let columns = whole_columns(conn, t, &f.whole, dates)?;
     let no_row = HashMap::new();
     let mut expr = parsed.clone();
     hoist(
@@ -600,7 +706,7 @@ mod tests {
     use crate::error::Error;
     use crate::formula::ErrorKind;
     use crate::rows::RowId;
-    use crate::schema::{ColumnId, ColumnType, TableId};
+    use crate::schema::{Aggregate, ColumnId, ColumnType, TableId};
     use crate::test_support::TempDir;
     use crate::workbook::Workbook;
 
@@ -955,5 +1061,179 @@ mod tests {
         assert_eq!(column(&o.book, o.t, total), [err.clone(), err]);
         o.book.undo().unwrap();
         assert_eq!(column(&o.book, o.t, total), [n(4.0), n(6.0)]);
+    }
+
+    fn totals(book: &Workbook, t: TableId) -> Vec<Option<CellValue>> {
+        book.totals(t).unwrap()
+    }
+
+    fn num(n: f64) -> CellValue {
+        CellValue::Number(n)
+    }
+
+    #[test]
+    fn totals_follow_every_edit_including_formula_columns() {
+        let mut o = orders();
+        o.book
+            .set_total(o.qty, Some(&Aggregate::Sum.formula("Qty")))
+            .unwrap();
+        assert_eq!(totals(&o.book, o.t), [Some(num(5.0)), None]);
+
+        o.book
+            .set_cell(o.qty, o.rows[0], &CellValue::Number(10.0))
+            .unwrap();
+        assert_eq!(totals(&o.book, o.t), [Some(num(13.0)), None]);
+        let extra = o
+            .book
+            .insert_row(o.t, &[(o.qty, CellValue::Number(1.0))])
+            .unwrap();
+        assert_eq!(totals(&o.book, o.t)[0], Some(num(14.0)));
+        o.book.delete_rows(o.t, &[extra]).unwrap();
+        assert_eq!(totals(&o.book, o.t)[0], Some(num(13.0)));
+        o.book.undo().unwrap();
+        assert_eq!(
+            totals(&o.book, o.t)[0],
+            Some(num(14.0)),
+            "undo restores the row"
+        );
+
+        // A total over a formula column follows the formula's inputs.
+        let total = o
+            .book
+            .add_formula_column(o.t, "Total", "=[@Qty]*[@Price]")
+            .unwrap();
+        o.book
+            .set_total(total, Some(&Aggregate::Sum.formula("Total")))
+            .unwrap();
+        assert_eq!(totals(&o.book, o.t)[2], Some(num(10.0 * 1.5 + 30.0)));
+        o.book
+            .set_cell(o.price, o.rows[1], &CellValue::Number(1.0))
+            .unwrap();
+        assert_eq!(totals(&o.book, o.t)[2], Some(num(15.0 + 3.0)));
+        assert_eq!(
+            totals(&o.book, o.t)[0],
+            Some(num(14.0)),
+            "the Qty total is unchanged"
+        );
+    }
+
+    #[test]
+    fn totals_are_stored_in_xel_columns_and_survive_reopen_and_save() {
+        let mut o = orders();
+        o.book
+            .set_total(o.price, Some(&Aggregate::Max.formula("Price")))
+            .unwrap();
+        let saved = o.path.with_file_name("saved.xel");
+        o.book.save_copy(&saved).unwrap();
+        o.book.close().unwrap();
+
+        let plain: (String, f64) = Connection::open(&o.path)
+            .unwrap()
+            .query_row(
+                "SELECT total, total_value FROM xel_columns WHERE name = 'Price'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(plain, ("=MAX([Price])".into(), 10.0));
+        for path in [&o.path, &saved] {
+            let book = Workbook::open(path).unwrap();
+            assert_eq!(totals(&book, o.t), [None, Some(num(10.0))]);
+            assert_eq!(
+                book.table(o.t).unwrap().columns[1].total.as_deref(),
+                Some("=MAX([Price])")
+            );
+        }
+    }
+
+    #[test]
+    fn setting_a_total_undoes_and_refuses_what_a_total_row_cannot_show() {
+        let mut o = orders();
+        let sum = Aggregate::Sum.formula("Qty");
+        o.book.set_total(o.qty, Some(&sum)).unwrap();
+        o.book.undo().unwrap();
+        assert_eq!(totals(&o.book, o.t), [None, None]);
+        o.book.redo().unwrap();
+        assert_eq!(totals(&o.book, o.t)[0], Some(num(5.0)));
+
+        assert!(matches!(
+            o.book.set_total(o.qty, Some("=[@Qty]")),
+            Err(Error::TotalReadsRow(_))
+        ));
+        assert!(matches!(
+            o.book.set_total(o.qty, Some("=SUM([Qty]")),
+            Err(Error::Formula { .. })
+        ));
+        assert_eq!(
+            totals(&o.book, o.t)[0],
+            Some(num(5.0)),
+            "refused totals change nothing"
+        );
+
+        // A deleted column takes its total along, and undo brings both back.
+        o.book.delete_column(o.qty).unwrap();
+        o.book.undo().unwrap();
+        assert_eq!(totals(&o.book, o.t)[0], Some(num(5.0)));
+
+        o.book.set_total(o.qty, None).unwrap();
+        assert_eq!(totals(&o.book, o.t), [None, None]);
+        assert!(o.book.table(o.t).unwrap().columns[0].total.is_none());
+    }
+
+    #[test]
+    fn aggregates_cover_every_kind_and_awkward_names() {
+        let dir = TempDir::new();
+        let mut book = Workbook::create(dir.path().join("book.xel")).unwrap();
+        let names = ["a]b", "it's", "#n", "@x", "[y"];
+        let columns: Vec<(&str, ColumnType)> =
+            names.iter().map(|n| (*n, ColumnType::Number)).collect();
+        let t = book.create_table("T", &columns).unwrap();
+        let ids: Vec<ColumnId> = book
+            .table(t)
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        for n in [1.0, 2.0, 6.0] {
+            let row: Vec<(ColumnId, CellValue)> =
+                ids.iter().map(|c| (*c, CellValue::Number(n))).collect();
+            book.insert_row(t, &row).unwrap();
+        }
+        let aggregates = [
+            (Aggregate::Sum, 9.0),
+            (Aggregate::Average, 3.0),
+            (Aggregate::Count, 3.0),
+            (Aggregate::Min, 1.0),
+            (Aggregate::Max, 6.0),
+        ];
+        for ((name, id), (aggregate, _)) in names.iter().zip(&ids).zip(aggregates) {
+            book.set_total(*id, Some(&aggregate.formula(name))).unwrap();
+        }
+        let want: Vec<Option<CellValue>> = aggregates.iter().map(|(_, n)| Some(num(*n))).collect();
+        assert_eq!(totals(&book, t), want);
+
+        let d = book
+            .create_table("Dates", &[("When", ColumnType::Date)])
+            .unwrap();
+        let when = book.table(d).unwrap().columns[0].id;
+        book.set_total(when, Some(&Aggregate::Average.formula("When")))
+            .unwrap();
+        assert_eq!(
+            totals(&book, d),
+            [Some(CellValue::Error(ErrorKind::Div0))],
+            "an empty column has no average"
+        );
+        book.set_total(when, Some(&Aggregate::Min.formula("When")))
+            .unwrap();
+        for day in [9, 3] {
+            let date = Date::new(2026, 11, day).unwrap();
+            book.insert_row(d, &[(when, CellValue::Date(date))])
+                .unwrap();
+        }
+        assert_eq!(
+            totals(&book, d),
+            [Some(CellValue::Date(Date::new(2026, 11, 3).unwrap()))]
+        );
     }
 }

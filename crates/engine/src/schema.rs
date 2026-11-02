@@ -28,6 +28,11 @@ CREATE TABLE xel_columns (
     formula TEXT CHECK ((type = 'formula') = (formula IS NOT NULL)),
     -- 'date' when a formula column's results are dates, so its ISO text reads back as dates.
     formula_kind TEXT CHECK (formula_kind IS NULL OR formula_kind = 'date'),
+    -- The column's total, a formula over whole columns (see 0026), and its result, stored
+    -- as a formula column's are: dates as ISO text marked by total_kind, errors as a BLOB.
+    total TEXT,
+    total_value ANY,
+    total_kind TEXT CHECK (total_kind IS NULL OR total_kind = 'date'),
     UNIQUE (table_id, name)
 ) STRICT;
 CREATE TABLE xel_select_options (
@@ -157,6 +162,9 @@ pub struct Column {
     pub options: Vec<String>,
     /// The formula of a `Formula` column, as written; `None` for other types.
     pub formula: Option<String>,
+    /// The formula of the column's total, shown in the table's total row; `None` when
+    /// the column has no total. [`Workbook::totals`] reads the results.
+    pub total: Option<String>,
     /// Whether a formula column's results are dates (see `recalc`).
     pub(crate) formula_dates: bool,
 }
@@ -217,6 +225,7 @@ impl Workbook {
                     position: i,
                     options: Vec::new(),
                     formula: None,
+                    total: None,
                 })
                 .collect();
             let spec = TableSpec {
@@ -312,6 +321,7 @@ impl Workbook {
                 position,
                 options: Vec::new(),
                 formula,
+                total: None,
             };
             Ok((
                 vec![Change::AddColumn {
@@ -342,6 +352,31 @@ impl Workbook {
                     column,
                     from,
                     to: formula.into(),
+                }],
+                (),
+            ))
+        })
+    }
+
+    /// Sets the formula of a column's total, or removes the total with `None`. A total
+    /// reads whole columns, such as `=SUM([Amount])`; [`Aggregate::formula`] writes the
+    /// common ones.
+    pub fn set_total(&mut self, column: ColumnId, formula: Option<&str>) -> Result<()> {
+        self.edit(|tx| {
+            let spec = column_spec(tx, column)?;
+            if let Some(formula) = formula {
+                check_total(&spec.name, formula)?;
+            }
+            if spec.total.as_deref() == formula {
+                return Ok((vec![], ()));
+            }
+            let table = column_info(tx, column)?.table;
+            Ok((
+                vec![Change::SetTotal {
+                    table,
+                    column,
+                    from: spec.total,
+                    to: formula.map(Into::into),
                 }],
                 (),
             ))
@@ -447,11 +482,17 @@ fn table_spec(conn: &Connection, id: TableId) -> Result<TableSpec> {
 
 /// Everything needed to recreate a column exactly.
 fn column_spec(conn: &Connection, id: ColumnId) -> Result<ColumnSpec> {
-    let (name, ty, position, formula): (String, String, i64, Option<String>) = conn
+    let (name, ty, position, formula, total): (
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT name, type, position, formula FROM xel_columns WHERE id = ?1",
+            "SELECT name, type, position, formula, total FROM xel_columns WHERE id = ?1",
             [id.0],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?
         .ok_or(Error::NoSuchColumn(id))?;
@@ -466,6 +507,7 @@ fn column_spec(conn: &Connection, id: ColumnId) -> Result<ColumnSpec> {
         position,
         options,
         formula,
+        total,
     })
 }
 
@@ -479,7 +521,7 @@ pub(crate) fn load_table(conn: &Connection, id: TableId) -> Result<Table> {
 /// Loads every table, or just `only`, with columns and options in one query.
 fn load_tables(conn: &Connection, only: Option<TableId>) -> Result<Vec<Table>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, c.id, c.name, c.type, o.value, c.formula, c.formula_kind
+        "SELECT t.id, t.name, c.id, c.name, c.type, o.value, c.formula, c.formula_kind, c.total
          FROM xel_tables t
          LEFT JOIN xel_columns c ON c.table_id = t.id
          LEFT JOIN xel_select_options o ON o.column_id = c.id
@@ -509,6 +551,7 @@ fn load_tables(conn: &Connection, only: Option<TableId>) -> Result<Vec<Table>> {
                 options: Vec::new(),
                 formula: r.get(6)?,
                 formula_dates: r.get::<_, Option<String>>(7)?.as_deref() == Some("date"),
+                total: r.get(8)?,
             });
         }
         if let Some(option) = r.get::<_, Option<String>>(5)? {
@@ -547,6 +590,52 @@ fn check_name(name: &str) -> Result<()> {
         return invalid("a name cannot contain control characters");
     }
     Ok(())
+}
+
+/// A total must parse and must not read a single row: there is no row in a total row.
+fn check_total(column: &str, formula: &str) -> Result<()> {
+    let expr = crate::formula::parse(formula).map_err(|error| Error::Formula {
+        column: column.into(),
+        error,
+    })?;
+    if crate::recalc::reads_this_row(&expr) {
+        return Err(Error::TotalReadsRow(column.into()));
+    }
+    Ok(())
+}
+
+/// The totals a total row offers by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Aggregate {
+    Sum,
+    Average,
+    Count,
+    Min,
+    Max,
+}
+
+impl Aggregate {
+    /// The total formula for `column`: `=SUM([Amount])`.
+    #[must_use]
+    pub fn formula(self, column: &str) -> String {
+        let function = match self {
+            Self::Sum => "SUM",
+            Self::Average => "AVERAGE",
+            Self::Count => "COUNT",
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+        };
+        // `'` escapes the next character in a structured reference; these are the ones
+        // that would otherwise end the name or change what the reference means.
+        let mut name = String::with_capacity(column.len());
+        for c in column.chars() {
+            if matches!(c, '[' | ']' | '\'' | '#' | '@') {
+                name.push('\'');
+            }
+            name.push(c);
+        }
+        format!("={function}([{name}])")
+    }
 }
 
 /// A formula must parse; references to columns that do not exist are allowed and show

@@ -7,7 +7,7 @@ public enum WorkbookChange: Sendable, Equatable {
     /// Tables or columns were added, removed, renamed, or redefined, which can change
     /// computed values anywhere: reload everything shown.
     case schema
-    /// Rows or cells of one table changed, and with them its formula columns.
+    /// Rows or cells of one table changed, and with them its formula columns and totals.
     case rows(table: Int64)
     /// An undo or redo: anything may have changed.
     case everything
@@ -157,6 +157,17 @@ public actor Workbook {
         try book.setFormula(column: column, formula: formula)
         publish(.schema)
     }
+
+    /// Sets a column's total formula, or removes the total with `nil`. `totalFormula(kind:
+    /// column:)` writes the ones a total row's menu offers.
+    public func setTotal(of column: Int64, to formula: String?) throws {
+        try book.setTotal(column: column, formula: formula)
+        publish(.schema)
+    }
+
+    /// Each column's total in column order; `nil` for a column without one. The table
+    /// shows a total row when any column has one.
+    public func totals(of table: Int64) throws -> [Cell?] { try book.totals(table: table) }
 
     public func renameColumn(_ column: Int64, to name: String) throws {
         try book.renameColumn(column: column, name: name)

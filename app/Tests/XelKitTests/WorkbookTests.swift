@@ -294,3 +294,25 @@ func makePeople(in scratch: Scratch) async throws -> (Workbook, TableInfo) {
     #expect(await !book.runsOnMainThread)
     try await book.close()
 }
+
+@Test func totalsFollowEditsAndCanBeRemoved() async throws {
+    let scratch = try Scratch()
+    let (book, people) = try await makePeople(in: scratch)
+    let age = people.columns[1]
+    #expect(try await book.totals(of: people.id) == [nil, nil])
+
+    try await book.setTotal(of: age.id, to: try totalFormula(kind: .sum, column: age.name))
+    #expect(try await book.table(people.id).columns[1].total == "=SUM([Age])")
+    for years in [30.0, 12.0] {
+        _ = try await book.insertRow(
+            into: people.id,
+            values: [ColumnValue(column: age.id, value: .number(value: years))]
+        )
+    }
+    #expect(try await book.totals(of: people.id) == [nil, .number(value: 42)])
+
+    #expect(await errorKind { try await book.setTotal(of: age.id, to: "=[@Age]") } == "Invalid")
+    try await book.setTotal(of: age.id, to: nil)
+    #expect(try await book.totals(of: people.id) == [nil, nil])
+    try await book.close()
+}

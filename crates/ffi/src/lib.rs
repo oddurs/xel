@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use xel_engine::{CellValue, ColumnId, ColumnType, Date, RowId, TableId, Workbook};
+use xel_engine::{Aggregate, CellValue, ColumnId, ColumnType, Date, RowId, TableId, Workbook};
 
 uniffi::setup_scaffolding!();
 
@@ -75,7 +75,8 @@ impl From<xel_engine::Error> for XelError {
             | E::Formula { .. }
             | E::NeedsFormula(_)
             | E::FormulaColumn(_)
-            | E::NotAFormulaColumn(_) => Self::Invalid { message },
+            | E::NotAFormulaColumn(_)
+            | E::TotalReadsRow(_) => Self::Invalid { message },
             _ => Self::Other { message },
         }
     }
@@ -127,6 +128,8 @@ pub struct ColumnInfo {
     pub options: Vec<String>,
     /// A formula column's formula, as written.
     pub formula: Option<String>,
+    /// The formula of the column's total, if it has one; `Book::totals` has the results.
+    pub total: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -150,10 +153,40 @@ impl From<xel_engine::Table> for TableInfo {
                     kind: c.ty.into(),
                     options: c.options,
                     formula: c.formula,
+                    total: c.total,
                 })
                 .collect(),
         }
     }
+}
+
+/// The totals a total row offers by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TotalKind {
+    Sum,
+    Average,
+    Count,
+    Min,
+    Max,
+}
+
+impl From<TotalKind> for Aggregate {
+    fn from(kind: TotalKind) -> Self {
+        match kind {
+            TotalKind::Sum => Self::Sum,
+            TotalKind::Average => Self::Average,
+            TotalKind::Count => Self::Count,
+            TotalKind::Min => Self::Min,
+            TotalKind::Max => Self::Max,
+        }
+    }
+}
+
+/// The total formula for `kind` over the column named `column`, as the total row's menu
+/// sets it: `=SUM([Amount])`.
+#[uniffi::export]
+pub fn total_formula(kind: TotalKind, column: &str) -> Result<String, XelError> {
+    Ok(Aggregate::from(kind).formula(column))
 }
 
 /// A column to create with a table. Formula columns are added afterwards, with
@@ -389,6 +422,25 @@ impl Book {
 
     pub fn set_formula(&self, column: i64, formula: &str) -> Result<(), XelError> {
         self.with(|b| Ok(b.set_formula(ColumnId::from_raw(column), formula)?))
+    }
+
+    /// Sets a column's total formula, or removes the total with `None`.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "UniFFI hands optional strings over owned"
+    )]
+    pub fn set_total(&self, column: i64, formula: Option<String>) -> Result<(), XelError> {
+        self.with(|b| Ok(b.set_total(ColumnId::from_raw(column), formula.as_deref())?))
+    }
+
+    /// Each column's total in column order; `None` for a column without one.
+    pub fn totals(&self, table: i64) -> Result<Vec<Option<Cell>>, XelError> {
+        self.with(|b| {
+            Ok(b.totals(TableId::from_raw(table))?
+                .into_iter()
+                .map(|t| t.map(Into::into))
+                .collect())
+        })
     }
 
     pub fn rename_column(&self, column: i64, name: &str) -> Result<(), XelError> {

@@ -291,18 +291,26 @@ fn each_value(
 
 /// The numbers an aggregate like SUM adds, by Excel's rules. Errors anywhere stop it.
 fn numbers(args: &Args<'_>) -> Result<Vec<f64>, ErrorKind> {
+    numbers_and_dates(args).map(|(ns, _)| ns)
+}
+
+/// The numbers an aggregate reads, and whether every one of them was a date.
+fn numbers_and_dates(args: &Args<'_>) -> Result<(Vec<f64>, bool), ErrorKind> {
     let mut out = Vec::new();
+    let mut dates = true;
     each_value(args, |v, from_cell| {
-        match (v, from_cell) {
-            (Value::Number(n) | Value::Date(n), _) => out.push(*n),
+        let n = match (v, from_cell) {
+            (Value::Date(n) | Value::Number(n), _) => *n,
             (Value::Error(e), _) => return Err(*e),
-            (Value::Bool(b), false) => out.push(f64::from(u8::from(*b))),
-            (Value::Text(s), false) => out.push(number_from_text(s).ok_or(ErrorKind::Value)?),
-            _ => {}
-        }
+            (Value::Bool(b), false) => f64::from(u8::from(*b)),
+            (Value::Text(s), false) => number_from_text(s).ok_or(ErrorKind::Value)?,
+            _ => return Ok(()),
+        };
+        dates &= matches!(v, Value::Date(_));
+        out.push(n);
         Ok(())
     })?;
-    Ok(out)
+    Ok((out, dates))
 }
 
 /// A value as a whole number of digits or a count, truncated toward zero as Excel does.
