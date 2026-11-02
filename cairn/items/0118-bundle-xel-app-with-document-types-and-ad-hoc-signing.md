@@ -3,8 +3,10 @@ id: 118
 uid: 48c00457-9c3b-4531-a625-8b1e95350981
 title: Bundle Xel.app with document types and ad-hoc signing
 type: chore
-status: planned
+status: doing
 milestone: v0.1
+assignee: Oddur Sigurdsson
+claimed: 2026-11-01
 depends_on:
 - 29
 created: 2026-11-01
@@ -24,7 +26,11 @@ A bare SwiftPM executable has no Info.plist, so macOS does not treat it as a reg
 
 ## Acceptance criteria
 
-- [ ] `open build/Xel.app` launches xel as a regular app with a Dock icon and its own menu bar
-- [ ] `mdls` / `lsregister` show the exported UTI after the bundle is opened once
-- [ ] `codesign --verify --strict build/Xel.app` passes
+- [x] `open build/Xel.app` launches xel as a regular app with a Dock icon and its own menu bar
+- [x] `mdls` / `lsregister` show the exported UTI after the bundle is opened once
+- [x] `codesign --verify --strict build/Xel.app` passes
 - [ ] CI builds the bundle
+
+## 2026-11-01
+
+Verified locally: System Events reports background only = false, frontmost = true, menu bar Apple, Xel, File, Edit, View, Window, Help; mdls on a .xel file gives kMDItemContentType io.github.oddurs.xel.workbook conforming to public.database; lsregister lists the claimed UTI; codesign --verify --strict passes.
