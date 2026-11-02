@@ -22,6 +22,8 @@ public final class XelDocument: NSDocument {
     private var watcher: Task<Void, Never>?
     /// Counts workbooks opened, so a load from a replaced one is never shown.
     private var generation = 0
+    /// The generation the grid was made for: a grid reads from one workbook.
+    private var gridGeneration = -1
 
     override public class var autosavesInPlace: Bool { true }
 
@@ -110,9 +112,13 @@ public final class XelDocument: NSDocument {
             let changes = await workbook.changes()
             await self?.load(from: workbook, generation: current)
             for await change in changes {
-                // Row edits leave the list of tables and columns as it was.
-                if case .rows = change { continue }
-                await self?.load(from: workbook, generation: current)
+                if case .rows(let table) = change {
+                    // Row edits leave the tables and columns as they were; only a grid
+                    // showing that table needs its rows again.
+                    await self?.refreshGrid(from: workbook, generation: current, onlyIf: table)
+                } else {
+                    await self?.load(from: workbook, generation: current)
+                }
             }
         }
     }
@@ -125,11 +131,93 @@ public final class XelDocument: NSDocument {
             await MainActor.run {
                 if self.generation == generation { self.model.set(tables) }
             }
+            await refreshGrid(from: workbook, generation: generation, onlyIf: nil)
         } catch is CancellationError {
             // The document closed.
+        } catch XelError.Closed {
+            // The document closed while this read waited its turn.
         } catch {
             await MainActor.run { report(error) }
         }
+    }
+
+    /// Shows the selected table in the grid, with its current columns and row count; a
+    /// grid already showing it keeps its scroll position and reloads its rows. With
+    /// `onlyIf`, only when that table is the one shown.
+    private nonisolated func refreshGrid(
+        from workbook: Workbook, generation: Int, onlyIf changed: Int64?, retry: Bool = true
+    ) async {
+        guard let table = await MainActor.run(body: { self.model.selection }),
+            changed == nil || changed == table
+        else {
+            await MainActor.run { if self.model.selection == nil { self.model.grid = nil } }
+            return
+        }
+        do {
+            let (info, count) = try await operations.run {
+                (try await workbook.table(table), try await workbook.rowCount(of: table))
+            }
+            await MainActor.run {
+                guard self.generation == generation, self.model.selection == table else { return }
+                if let grid = self.model.grid, grid.table == table,
+                    self.gridGeneration == generation
+                {
+                    grid.reset(columns: info.columns, rowCount: Int(count))
+                } else {
+                    self.model.grid = self.makeGrid(
+                        table, info: info, rowCount: Int(count), on: workbook)
+                    self.gridGeneration = generation
+                }
+            }
+        } catch is CancellationError {
+            // The document closed.
+        } catch XelError.Closed {
+            // The document closed while this read waited its turn.
+        } catch let error as XelError {
+            // The table went away between the selection and the read: show another, once.
+            if case .Gone = error, retry {
+                await MainActor.run {
+                    if self.model.selection == table {
+                        self.model.selection = self.model.tables.first { $0.id != table }?.id
+                    }
+                }
+                await refreshGrid(from: workbook, generation: generation, onlyIf: nil, retry: false)
+            } else if case .Gone = error {
+                await MainActor.run { self.model.grid = nil }
+            } else {
+                await MainActor.run { report(error) }
+            }
+        } catch {
+            await MainActor.run { report(error) }
+        }
+    }
+
+    private func makeGrid(
+        _ table: Int64, info: TableInfo, rowCount: Int, on workbook: Workbook
+    ) -> GridData {
+        let grid = GridData(table: table, columns: info.columns, rowCount: rowCount) {
+            [operations] offset, limit, stillWanted in
+            try await operations.run {
+                // A grid scrolled far away no longer needs this page; skip the read.
+                guard stillWanted() else { throw CancellationError() }
+                return try await workbook.rows(of: table, offset: offset, limit: limit)
+            }
+        }
+        grid.onError = { [weak self] error in
+            if case XelError.Closed? = error as? XelError { return }
+            self?.report(error)
+        }
+        return grid
+    }
+
+    /// Shows `table` in the grid.
+    func select(_ table: Int64?) {
+        // Clicking the sidebar's empty space deselects; keep showing the table instead.
+        guard let table, model.selection != table else { return }
+        model.selection = table
+        guard let workbook else { return }
+        let generation = generation
+        Task { await refreshGrid(from: workbook, generation: generation, onlyIf: nil) }
     }
 
     override public func close() {
@@ -212,11 +300,14 @@ public final class XelDocument: NSDocument {
         }
     }
 
+    /// Shows an error on the document's window. A document without one (closing, or in a
+    /// test) logs it instead: an application-modal alert would block everything behind it.
     private func report(_ error: any Error) {
         if let window = windowControllers.first?.window {
             presentError(error, modalFor: window, delegate: nil, didPresent: nil, contextInfo: nil)
         } else {
-            presentError(error)
+            // Error messages can name the user's tables and columns.
+            Self.log.error("an error with no window to show it on: \(error, privacy: .private)")
         }
     }
 
@@ -252,7 +343,10 @@ public final class XelDocument: NSDocument {
     // MARK: Windows
 
     override public func makeWindowControllers() {
-        let view = DocumentView(model: model, addTable: { [weak self] in self?.addTable() })
+        let view = DocumentView(
+            model: model,
+            addTable: { [weak self] in self?.addTable() },
+            select: { [weak self] in self?.select($0) })
         let hosting = NSHostingController(rootView: view)
         // The view sets the smallest size; the user, not the content, sets the rest.
         hosting.sizingOptions = [.minSize]
