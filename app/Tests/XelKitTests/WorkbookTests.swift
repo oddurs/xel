@@ -29,6 +29,7 @@ extension XelError {
         case .NewerFormat: "NewerFormat"
         case .ReadOnly: "ReadOnly"
         case .Corrupt: "Corrupt"
+        case .ChangedOutside: "ChangedOutside"
         case .Gone: "Gone"
         case .Invalid: "Invalid"
         case .Other: "Other"
@@ -112,7 +113,7 @@ func makePeople(in scratch: Scratch) async throws -> (Workbook, TableInfo) {
     let ratio = try await book.addFormulaColumn(
         to: people.id, named: "Ratio", formula: "=10/[@Age]")
 
-    var ids: [Int64] = []
+    var ids: [RowRef] = []
     for person in ["Ada", "Grace", "Edsger"] {
         ids.append(
             try await book.insertRow(
@@ -138,6 +139,21 @@ func makePeople(in scratch: Scratch) async throws -> (Workbook, TableInfo) {
 
     try await book.deleteRows([ids[1]], from: people.id)
     #expect(try await book.rows(of: people.id, offset: 0, limit: 10).map(\.id) == [ids[0], ids[2]])
+
+    // Row ids are numbered per table, so another table has a row with the same number.
+    let other = try await book.createTable(
+        named: "Other", columns: [NewColumn(name: "x", kind: .text)])
+    let stranger = try await book.insertRow(into: other, values: [])
+    #expect(stranger.row == ids[0].row)
+    #expect(await errorKind { try await book.deleteRows([stranger], from: people.id) } == "Gone")
+    #expect(
+        await errorKind {
+            try await book.setCells(
+                in: people.id, [CellEdit(row: stranger, column: name, value: .empty)])
+        } == "Gone"
+    )
+    #expect(try await book.rowCount(of: people.id) == 2)
+    #expect(try await book.rowCount(of: other) == 1)
     try await book.close()
 }
 
@@ -173,6 +189,39 @@ func makePeople(in scratch: Scratch) async throws -> (Workbook, TableInfo) {
     var seen: [WorkbookChange] = []
     for await change in changes { seen.append(change) }
     #expect(seen == [.rows(table: people.id), .schema, .everything, .everything])
+}
+
+@Test func streamsEndWhenTheWorkbookClosesOrIsReleased() async throws {
+    let scratch = try Scratch()
+    var (book, _) = try await makePeople(in: scratch)
+    try await book.close()
+    for await _ in await book.changes() { Issue.record("a closed workbook reports no changes") }
+
+    book = try await Workbook.open(scratch.file("people.xel"))
+    let changes = await book.changes()
+    book = try await Workbook.create(at: scratch.file("other.xel"))
+    for await _ in changes { Issue.record("a released workbook reports no changes") }
+    try await book.close()
+}
+
+@Test func anUndoTheFileNoLongerAllowsIsReportedAsAChange() async throws {
+    let scratch = try Scratch()
+    let (book, people) = try await makePeople(in: scratch)
+    let name = people.columns[0].id
+    let row = try await book.insertRow(into: people.id, values: [])
+    try await book.setCells(
+        in: people.id, [CellEdit(row: row, column: name, value: .text(value: "x"))])
+    // Another session deletes the row the latest edit touched.
+    let other = try await Workbook.open(scratch.file("people.xel"))
+    try await other.deleteRows([row], from: people.id)
+    try await other.close()
+
+    let changes = await book.changes()
+    #expect(await errorKind { try await book.undo() } == "ChangedOutside")
+    try await book.close()
+    var seen: [WorkbookChange] = []
+    for await change in changes { seen.append(change) }
+    #expect(seen == [.everything])
 }
 
 @Test func workingCopiesLeaveTheDocumentAloneUntilSaved() async throws {
@@ -232,6 +281,8 @@ func makePeople(in scratch: Scratch) async throws -> (Workbook, TableInfo) {
     #expect(thrown.hasPrefix("not an XelError"))
     #expect(thrown.contains("panics on purpose"))
     #expect(await errorKind { _ = try await book.tables() } == "Poisoned")
+    try await book.close()
+    #expect(await errorKind { _ = try await book.tables() } == "Poisoned")
 }
 
 @MainActor
@@ -239,6 +290,7 @@ func makePeople(in scratch: Scratch) async throws -> (Workbook, TableInfo) {
     let scratch = try Scratch()
     let (book, _) = try await makePeople(in: scratch)
     #expect(await book.isOnEngineQueue)
+
     #expect(await !book.runsOnMainThread)
     try await book.close()
 }

@@ -80,7 +80,10 @@ relink_if_stale() {
 swift_test() {
     host_engine
     prof=$(profile)
-    relink_if_stale "$(swift build --package-path app -c "$prof" --show-bin-path)/XelPackageTests.xctest/Contents/MacOS/XelPackageTests"
+    # Its own build directory: the test flags differ from the app's, and sharing one would
+    # make each rebuild everything the other built.
+    scratch=app/.build-tests
+    relink_if_stale "$(swift build --package-path app --scratch-path "$scratch" -c "$prof" --show-bin-path)/XelPackageTests.xctest/Contents/MacOS/XelPackageTests"
     # Xcode finds Swift Testing itself; the Command Line Tools ship it outside the default
     # search paths.
     developer=$(xcode-select -p)
@@ -92,7 +95,8 @@ swift_test() {
             -Xlinker -rpath -Xlinker "$developer/Library/Developer/usr/lib"
     fi
     XEL_ENGINE_LIB_DIR=$lib_dir \
-        swift test --package-path app -Xswiftc -warnings-as-errors -c "$prof" "$@"
+        swift test --package-path app --scratch-path "$scratch" -Xswiftc -warnings-as-errors \
+        -c "$prof" "$@"
 }
 
 # Builds the engine, the bindings, and the Swift app.

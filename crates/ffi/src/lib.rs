@@ -30,6 +30,10 @@ pub enum XelError {
     ReadOnly { message: String },
     #[error("{message}")]
     Corrupt { message: String },
+    /// Another tool changed the file in a way an undo or redo could not reconcile; that
+    /// step is dropped from history. The app reloads what it shows.
+    #[error("{message}")]
+    ChangedOutside { message: String },
     /// A table, column, or row the app still showed is gone, after an undo for example.
     /// The app reloads what it shows.
     #[error("{message}")]
@@ -57,7 +61,8 @@ impl From<xel_engine::Error> for XelError {
             E::NotAWorkbook(_) => Self::NotAWorkbook { message },
             E::NewerFormat { .. } => Self::NewerFormat { message },
             E::ReadOnly(_) => Self::ReadOnly { message },
-            E::Corrupt(_) | E::ChangedOutside(_) => Self::Corrupt { message },
+            E::Corrupt(_) => Self::Corrupt { message },
+            E::ChangedOutside(_) => Self::ChangedOutside { message },
             E::NoSuchTable(_) | E::NoSuchColumn(_) | E::NoSuchRow(_) => Self::Gone { message },
             E::InvalidName { .. }
             | E::DuplicateName(_)
@@ -225,10 +230,33 @@ impl TryFrom<Cell> for CellValue {
     }
 }
 
+/// A row's identity. Row ids are numbered per table, so the table travels with the id:
+/// an id held over from another table is refused rather than editing that table's row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct RowRef {
+    pub table: i64,
+    pub row: i64,
+}
+
+impl From<RowId> for RowRef {
+    fn from(id: RowId) -> Self {
+        Self {
+            table: id.table().raw(),
+            row: id.raw(),
+        }
+    }
+}
+
+impl From<RowRef> for RowId {
+    fn from(r: RowRef) -> Self {
+        RowId::new(TableId::from_raw(r.table), r.row)
+    }
+}
+
 /// One row's cells, in the table's column order.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct RowData {
-    pub id: i64,
+    pub id: RowRef,
     pub cells: Vec<Cell>,
 }
 
@@ -242,7 +270,7 @@ pub struct ColumnValue {
 /// A value for one cell of an existing row.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct CellEdit {
-    pub row: i64,
+    pub row: RowRef,
     pub column: i64,
     pub value: Cell,
 }
@@ -293,9 +321,13 @@ impl Book {
     }
 
     /// Closes the file, dropping undo history and its trash, and reports failures that
-    /// releasing the object would hide. Later calls fail with `Closed`.
+    /// releasing the object would hide. Later calls fail with `Closed`. A poisoned book
+    /// closes too: closing needs nothing from the history a panic may have broken.
     pub fn close(&self) -> Result<(), XelError> {
-        let mut guard = self.inner.lock().map_err(|_| XelError::Poisoned)?;
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match guard.take() {
             Some(book) => Ok(book.close()?),
             None => Err(XelError::Closed),
@@ -386,7 +418,7 @@ impl Book {
             Ok(b.rows(TableId::from_raw(table), offset, limit)?
                 .into_iter()
                 .map(|r| RowData {
-                    id: r.id.raw(),
+                    id: r.id.into(),
                     cells: r.cells.into_iter().map(Into::into).collect(),
                 })
                 .collect())
@@ -394,12 +426,12 @@ impl Book {
     }
 
     /// Adds a row at the end of `table`; columns not given are empty. Returns its id.
-    pub fn insert_row(&self, table: i64, values: Vec<ColumnValue>) -> Result<i64, XelError> {
+    pub fn insert_row(&self, table: i64, values: Vec<ColumnValue>) -> Result<RowRef, XelError> {
         let values = values
             .into_iter()
             .map(|v| Ok((ColumnId::from_raw(v.column), v.value.try_into()?)))
             .collect::<Result<Vec<_>, XelError>>()?;
-        self.with(|b| Ok(b.insert_row(TableId::from_raw(table), &values)?.raw()))
+        self.with(|b| Ok(b.insert_row(TableId::from_raw(table), &values)?.into()))
     }
 
     /// Sets cells of `table`, all or none, as one undo step.
@@ -410,7 +442,7 @@ impl Book {
             .map(|e| {
                 Ok((
                     ColumnId::from_raw(e.column),
-                    RowId::new(t, e.row),
+                    e.row.into(),
                     e.value.try_into()?,
                 ))
             })
@@ -418,10 +450,9 @@ impl Book {
         self.with(|b| Ok(b.set_cells(t, &edits)?))
     }
 
-    pub fn delete_rows(&self, table: i64, rows: Vec<i64>) -> Result<(), XelError> {
-        let t = TableId::from_raw(table);
-        let rows: Vec<RowId> = rows.into_iter().map(|r| RowId::new(t, r)).collect();
-        self.with(|b| Ok(b.delete_rows(t, &rows)?))
+    pub fn delete_rows(&self, table: i64, rows: Vec<RowRef>) -> Result<(), XelError> {
+        let rows: Vec<RowId> = rows.into_iter().map(Into::into).collect();
+        self.with(|b| Ok(b.delete_rows(TableId::from_raw(table), &rows)?))
     }
 
     /// Undoes the last edit; false when there is nothing to undo.

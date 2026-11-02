@@ -35,17 +35,17 @@ pub enum Error {
     InvalidName { name: String, reason: String },
     #[error("the name {0:?} is already used")]
     DuplicateName(String),
-    #[error("table {0:?} does not exist")]
+    #[error("table {} does not exist", .0.raw())]
     NoSuchTable(TableId),
-    #[error("column {0:?} does not exist")]
+    #[error("column {} does not exist", .0.raw())]
     NoSuchColumn(ColumnId),
     #[error("a table needs at least one column")]
     NoColumns,
     #[error("a table must keep at least one column; delete the table instead")]
     LastColumn(ColumnId),
-    #[error("column {0:?} is not a select column")]
+    #[error("column {} is not a select column", .0.raw())]
     NotASelectColumn(ColumnId),
-    #[error("row {0:?} does not exist")]
+    #[error("row {} of table {} does not exist", .0.raw(), .0.table().raw())]
     NoSuchRow(RowId),
     #[error("column {column:?} holds {expected} values, not {found}")]
     TypeMismatch {
@@ -70,7 +70,7 @@ pub enum Error {
     NeedsFormula(String),
     #[error("column {0:?} is computed by a formula and cannot be edited")]
     FormulaColumn(String),
-    #[error("column {0:?} is not a formula column")]
+    #[error("column {} is not a formula column", .0.raw())]
     NotAFormulaColumn(ColumnId),
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),

@@ -4,7 +4,8 @@ import XelEngine
 
 /// What an edit changed, so a view reloads only what it shows.
 public enum WorkbookChange: Sendable, Equatable {
-    /// Tables or columns were added, removed, renamed, or redefined.
+    /// Tables or columns were added, removed, renamed, or redefined, which can change
+    /// computed values anywhere: reload everything shown.
     case schema
     /// Rows or cells of one table changed, and with them its formula columns.
     case rows(table: Int64)
@@ -17,17 +18,26 @@ public enum WorkbookChange: Sendable, Equatable {
 public actor Workbook {
     private let book: Book
     private let queue: DispatchSerialQueue
+    private let queueKey: DispatchSpecificKey<Void>
     private var observers: [UUID: AsyncStream<WorkbookChange>.Continuation] = [:]
-
-    private static let queueKey = DispatchSpecificKey<Void>()
+    private var closed = false
 
     public nonisolated var unownedExecutor: UnownedSerialExecutor {
         queue.asUnownedSerialExecutor()
     }
 
-    private init(book: Book, queue: DispatchSerialQueue) {
+    private init(book: Book, queue: DispatchSerialQueue, queueKey: DispatchSpecificKey<Void>) {
         self.book = book
         self.queue = queue
+        self.queueKey = queueKey
+    }
+
+    /// A workbook released without `close()` still ends its change streams, and the
+    /// engine is released on the workbook's queue, never on the thread that let it go.
+    /// The engine drops its undo trash on the next open.
+    deinit {
+        for observer in observers.values { observer.finish() }
+        queue.async { [book] in _ = book }
     }
 
     /// Opens or creates the engine's book on a new queue, which the workbook then runs on.
@@ -35,11 +45,12 @@ public actor Workbook {
         -> Workbook
     {
         let queue = DispatchSerialQueue(label: "io.github.oddurs.xel.workbook")
+        let queueKey = DispatchSpecificKey<Void>()
         queue.setSpecific(key: queueKey, value: ())
         let book = try await withCheckedThrowingContinuation { continuation in
             queue.async { continuation.resume(with: Result { try open() }) }
         }
-        return Workbook(book: book, queue: queue)
+        return Workbook(book: book, queue: queue, queueKey: queueKey)
     }
 
     /// Creates a new workbook file at `url`, which must not exist yet.
@@ -67,9 +78,11 @@ public actor Workbook {
         try book.saveCopy(dest: url.path(percentEncoded: false))
     }
 
-    /// Closes the file and ends every change stream. Later calls throw `XelError.Closed`.
+    /// Closes the file and ends every change stream. Later calls throw `XelError.Closed`,
+    /// even when closing itself fails: the engine has let go of the file either way.
     public func close() throws {
         defer {
+            closed = true
             for observer in observers.values { observer.finish() }
             observers.removeAll()
         }
@@ -80,9 +93,14 @@ public actor Workbook {
 
     // MARK: Changes
 
-    /// Every change made through this workbook from now on, until it closes.
+    /// Every change made through this workbook from now on, until it closes. A stream
+    /// asked for after closing is already finished.
     public func changes() -> AsyncStream<WorkbookChange> {
         let (stream, continuation) = AsyncStream.makeStream(of: WorkbookChange.self)
+        if closed {
+            continuation.finish()
+            return stream
+        }
         let id = UUID()
         observers[id] = continuation
         continuation.onTermination = { [weak self] _ in
@@ -165,7 +183,7 @@ public actor Workbook {
     }
 
     /// Adds a row at the end of `table`; columns not given are empty. Returns its id.
-    public func insertRow(into table: Int64, values: [ColumnValue]) throws -> Int64 {
+    public func insertRow(into table: Int64, values: [ColumnValue]) throws -> RowRef {
         let id = try book.insertRow(table: table, values: values)
         publish(.rows(table: table))
         return id
@@ -177,7 +195,7 @@ public actor Workbook {
         publish(.rows(table: table))
     }
 
-    public func deleteRows(_ rows: [Int64], from table: Int64) throws {
+    public func deleteRows(_ rows: [RowRef], from table: Int64) throws {
         try book.deleteRows(table: table, rows: rows)
         publish(.rows(table: table))
     }
@@ -186,18 +204,23 @@ public actor Workbook {
 
     /// Undoes the last edit; false when there was nothing to undo.
     @discardableResult
-    public func undo() throws -> Bool {
-        let undone = try book.undo()
-        if undone { publish(.everything) }
-        return undone
-    }
+    public func undo() throws -> Bool { try replay(book.undo) }
 
     /// Redoes the last undone edit; false when there was nothing to redo.
     @discardableResult
-    public func redo() throws -> Bool {
-        let redone = try book.redo()
-        if redone { publish(.everything) }
-        return redone
+    public func redo() throws -> Bool { try replay(book.redo) }
+
+    private func replay(_ step: () throws -> Bool) throws -> Bool {
+        do {
+            let replayed = try step()
+            if replayed { publish(.everything) }
+            return replayed
+        } catch {
+            // A step the file no longer allows is dropped from history, so what can be
+            // undone, and what views show, may have changed.
+            publish(.everything)
+            throw error
+        }
     }
 
     public func canUndo() throws -> Bool { try book.canUndo() }
@@ -207,7 +230,7 @@ public actor Workbook {
     // MARK: For tests
 
     /// Whether the caller is running on this workbook's queue.
-    var isOnEngineQueue: Bool { DispatchQueue.getSpecific(key: Self.queueKey) != nil }
+    var isOnEngineQueue: Bool { DispatchQueue.getSpecific(key: queueKey) != nil }
 
     var runsOnMainThread: Bool { Thread.isMainThread }
 
